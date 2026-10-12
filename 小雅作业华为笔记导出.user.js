@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         小雅手写归档
+// @name         小雅作业华为笔记导出
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
 // @version      1.0.1
-// @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
+// @description  作业题目自动转手写笔迹：打开作业页自动捕获题目，导出 .hinote（华为笔记导入）/ PDF / JPG。原「小雅辅助工具·笔记版手写导出」完整功能，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
 // @icon         https://www.ai-augmented.com/static/logo3.1dbbea8f.png
@@ -15,7 +15,7 @@
 // ==/UserScript==
 
 /*
- * 小雅手写归档 — 引擎备份版
+ * 小雅作业华为笔记导出 — 引擎备份版
  * 内容 = 原小雅辅助工具 §14 手写纸引擎全文：
  *   XYHinote（华为 .hinote 写入器 + Stroke 笔迹容器）/ XYLayout（文字排版 → 笔顺笔迹）
  *   / XYPaper（A4 笔记纸分页）/ XYExport（JPEG 页 → PDF 合成）/ XY_HW_DB 笔顺库
@@ -41,7 +41,7 @@
                 // 同时兼容旧 quiz/ 前缀与新 survey/course/ 前缀的试卷接口
                 const response = await _hw_nativeFetch.apply(this, arguments);
                 if (response.ok) {
-                    console.log('[小雅手写归档] 已捕获 fetch 题目数据包(200)');
+                    console.log('[小雅作业华为笔记导出] 已捕获 fetch 题目数据包(200)');
                     hwCaptureParams(rawUrl);
                 }
                 try {
@@ -49,7 +49,7 @@
                     let data;
                     try { data = await cloned.json(); } catch (e) { data = JSON.parse(await cloned.text()); }
                     if (data && data.data && data.data.questions) hwProcessPaperData(data);
-                } catch (e) { console.error('[小雅手写归档] fetch 数据解包失败', e); }
+                } catch (e) { console.error('[小雅作业华为笔记导出] fetch 数据解包失败', e); }
                 return response;
             }
             return _prevFetch.apply(this, arguments);
@@ -70,7 +70,7 @@
                 if (self._hw_url && self._hw_url.includes('/queryStuPaper/v2')) {
                     self.addEventListener('load', function () {
                         if (self.status === 200) {
-                            console.log('[小雅手写归档] 已捕获 XHR 题目数据包(200)');
+                            console.log('[小雅作业华为笔记导出] 已捕获 XHR 题目数据包(200)');
                             hwCaptureParams(self._hw_url);
                         }
                     });
@@ -81,13 +81,13 @@
                                 self.response.text().then(function (text) {
                                     const parsed = JSON.parse(text);
                                     if (parsed && parsed.data && parsed.data.questions) hwProcessPaperData(parsed);
-                                }).catch(function (e) { console.error('[小雅手写归档] blob→text 解包失败', e); });
+                                }).catch(function (e) { console.error('[小雅作业华为笔记导出] blob→text 解包失败', e); });
                                 return;
                             }
                             if (self.responseType === 'json' && self.response) data = self.response;
                             else if ((self.responseType === '' || self.responseType === 'text') && self.responseText) data = JSON.parse(self.responseText);
                             if (data && data.data && data.data.questions) hwProcessPaperData(data);
-                        } catch (e) { console.error('[小雅手写归档] XHR 解包失败', e); }
+                        } catch (e) { console.error('[小雅作业华为笔记导出] XHR 解包失败', e); }
                     });
                     return _hw_nativeXhrSend.apply(this, arguments);
                 }
@@ -2425,7 +2425,22 @@ var XYExport = (function (Hinote) {  'use strict';
             try { localStorage.setItem(this.KEY, t); } catch (e) {}
         }
     };
-    console.log('[小雅手写归档] 引擎加载完成 v1.0.1');
+
+    var XyhScope = {
+        KEY: 'xyh_scope',
+        get: function () {
+            try {
+                var raw = (typeof GM_getValue === 'function') ? GM_getValue(this.KEY, '') : localStorage.getItem(this.KEY);
+                var o = raw ? JSON.parse(raw) : {};
+                return { q: o.q !== false, std: o.std !== false, mine: o.mine !== false };
+            } catch (e) { return { q: true, std: true, mine: true }; }
+        },
+        set: function (scope) {
+            try { if (typeof GM_setValue === 'function') GM_setValue(this.KEY, JSON.stringify(scope)); } catch (e) {}
+            try { localStorage.setItem(this.KEY, JSON.stringify(scope)); } catch (e) {}
+        }
+    };
+    console.log('[小雅作业华为笔记导出] 引擎加载完成 v1.0.1');
 
     // 调试句柄：控制台可用 XyHandwriting.* 手动调用引擎各模块
     try { globalThis.XyHandwriting = { XYPaper: XYPaper, XYHinote: XYHinote, XYExport: XYExport, XY_HW_DB: XY_HW_DB, xyHWRaster: xyHWRaster, xyHWRasterPrinted: xyHWRasterPrinted }; } catch (e) {}
@@ -2494,19 +2509,26 @@ var XYExport = (function (Hinote) {  'use strict';
         if (tg) tg.textContent = theme === 'light' ? '🌙' : '☀️';
     }
 
+    function xyhScopeGet() { var sc = XyhScope.get();
+        ['q', 'std', 'mine'].forEach(function (k) {
+            var el = document.getElementById('xyh-scope-' + k);
+            if (el) sc[k] = el.checked;
+        });
+        return sc;
+    }
+
     async function exportAs(fmt) {
-        var ta = document.getElementById('xyh-input');
-        var text = (ta && ta.value || '').trim();
         var autoImages = [];
         var imMap = new Map();
-        if (!text && hwQuestionsData && hwQuestionsData.length) {
+        var text = '';
+        if (hwQuestionsData && hwQuestionsData.length) {
             var _items = xyExpCollect();
-            var _nt = xyExpNotesText(_items, { q: true, std: true, mine: true }, true);
+            var _nt = xyExpNotesText(_items, xyhScopeGet(), true);
             text = _nt.text;
             imMap = _nt.imgList.length ? await hwHydrateImageMap(_nt.imgList, 1000, false) : new Map();
             autoImages = xyExpNotesImages(_nt.imgList, imMap);
         }
-        if (!text) { xyhToast('未捕获到作业题目，且未粘贴文字。请先打开作业页面点 🔄，或直接粘贴内容', 'warning'); return; }
+        if (!text) { xyhToast('还未捕获到作业题目，请先打开作业/试卷页面', 'warning'); return; }
         var btns = document.querySelectorAll('[data-xhn-fmt]');
         btns.forEach(function (b) { b.disabled = true; });
         var st = document.getElementById('xyh-status');
@@ -2629,9 +2651,6 @@ var XYExport = (function (Hinote) {  'use strict';
                 'padding:3px 6px; border-radius:7px; line-height:1;}' +
             '#xyh-panel .xyh-icon-btn:hover{background:var(--xyh-surface2); color:var(--xyh-text);}' +
             '#xyh-panel .xyh-body{padding:12px 13px; display:flex; flex-direction:column; gap:9px;}' +
-            '#xyh-panel textarea{width:100%; min-height:150px; resize:vertical; padding:9px 11px; font-size:12.5px; line-height:1.65;' +
-                'border-radius:9px; border:1px solid var(--xyh-border); background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
-            '#xyh-panel textarea:focus{border-color:#a855f7; box-shadow:0 0 0 3px rgba(168,85,247,.14);}' +
             '#xyh-panel input{width:100%; padding:7px 10px; font-size:11.5px; border-radius:8px; border:1px solid var(--xyh-border);' +
                 'background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
             '#xyh-panel .xyh-meta{display:flex; justify-content:space-between; font-size:10px; color:var(--xyh-muted);}' +
@@ -2656,16 +2675,20 @@ var XYExport = (function (Hinote) {  'use strict';
         head.className = 'xyh-head';
         head.innerHTML =
             '<span aria-hidden="true">' + XYH_LOGO_SVG + '</span>' +
-            '<span class="xyh-title">小雅手写归档</span>' +
+            '<span class="xyh-title">小雅作业华为笔记导出</span>' +
             '<button type="button" id="xyh-theme-toggle" class="xyh-icon-btn" aria-label="切换主题" title="切换主题"></button>' +
             '<button type="button" id="xyh-minimize" class="xyh-icon-btn" aria-label="收起面板" title="收起">—</button>';
 
         var body = document.createElement('div');
         body.className = 'xyh-body';
         body.innerHTML =
-            '<textarea id="xyh-input" placeholder="把题目、错题、知识点、复习提纲粘贴到这里…&#10;一键变手写 · 自动分页" aria-label="文字内容"></textarea>' +
-            '<div class="xyh-meta"><span id="xyh-count">0 字</span><span>A4 笔记纸 · 自动分页 · 可导入华为笔记</span></div>' +
-            '<input id="xhn-fname" placeholder="文件名（默认：手写归档）" aria-label="文件名">' +
+            '<div class="xyh-meta" style="margin-bottom:0;"><span id="xyh-count">进入作业页面自动捕获题目</span><span>A4 笔记纸 · 自动分页</span></div>' +
+            '<div class="xyh-scope" style="display:flex; gap:11px; font-size:11px; color:var(--xyh-text2); margin-bottom:2px;">' +
+                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-q" style="accent-color:#06b6d4; cursor:pointer; margin:0;" checked/>题目</label>' +
+                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-std" style="accent-color:#06b6d4; cursor:pointer; margin:0;" checked/>标准答案</label>' +
+                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-mine" style="accent-color:#06b6d4; cursor:pointer; margin:0;" checked/>我的作答</label>' +
+            '</div>' +
+            '<input id="xhn-fname" placeholder="文件名（默认：作业手写归档）" aria-label="文件名">' +
             '<div class="xyh-btns">' +
                 '<button class="xyh-btn xyh-btn-hinote" data-xhn-fmt="hinote" type="button">📒 .hinote</button>' +
                 '<button class="xyh-btn xyh-btn-pdf" data-xhn-fmt="pdf" type="button">📄 PDF</button>' +
@@ -2720,13 +2743,6 @@ var XYExport = (function (Hinote) {  'use strict';
                 }
             }, true);
         })();
-        /* 字数统计 */
-        var ta = panel.querySelector('#xyh-input');
-        var cnt = panel.querySelector('#xyh-count');
-        ta.addEventListener('input', function () {
-            var n = ta.value.replace(/\s/g, '').length;
-            cnt.textContent = n + ' 字' + (n > 0 ? ' · 约 ' + Math.max(1, Math.ceil(n / 320)) + ' 页' : '');
-        });
         /* 导出按钮 */
         panel.querySelectorAll('[data-xhn-fmt]').forEach(function (b) {
             b.addEventListener('click', function () { void exportAs(b.getAttribute('data-xhn-fmt')); });
@@ -2747,11 +2763,24 @@ var XYExport = (function (Hinote) {  'use strict';
             if (hwQuestionsData.length) { hwUpdateUI(); return; }
             if (getPaperId() || /[?&]paper_id=/.test(location.href)) void hwProactiveFetchData();
         }
+        /* 内容范围：恢复勾选 + 变更持久化 */
+        var sc = XyhScope.get();
+        ['q', 'std', 'mine'].forEach(function (k) {
+            var el = panel.querySelector('#xyh-scope-' + k);
+            if (el) {
+                el.checked = sc[k];
+                el.addEventListener('change', function () {
+                    var cur = { q: panel.querySelector('#xyh-scope-q').checked, std: panel.querySelector('#xyh-scope-std').checked, mine: panel.querySelector('#xyh-scope-mine').checked };
+                    if (!cur.q && !cur.std && !cur.mine) { el.checked = true; xyhToast('至少保留一项内容', 'warning'); return; }
+                    XyhScope.set(cur);
+                });
+            }
+        });
         setTimeout(xyhAutoScan, 800);
         setInterval(xyhAutoScan, 8000);
         hwUpdateUI();
-        console.log('[小雅手写归档] UI 已挂载');
-        } catch (e) { console.error('[小雅手写归档] UI 挂载失败：', e); }
+        console.log('[小雅作业华为笔记导出] UI 已挂载');
+        } catch (e) { console.error('[小雅作业华为笔记导出] UI 挂载失败：', e); }
     }
 
     if (document.readyState === 'loading') {
