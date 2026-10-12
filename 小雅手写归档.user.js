@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅手写归档
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.2
+// @version      1.0.3
 // @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -1486,6 +1486,848 @@ var XYExport = (function (Hinote) {  'use strict';
     }
 
 
+
+    /* ── 平台作业数据状态（自小雅辅助工具 §11 迁移） ── */
+    let hwQuestionsData = [];
+    let hwExtractedText = '';
+    let hwImageAssets = [];
+    let hwPdfQuestions = [];
+    let hwSubmissionResult = { state: 'waiting', message: '等待题目数据加载...' };
+    let hwGroupId = '', hwNodeId = '', hwPaperId = '';
+    let hwActiveTaskKey = '', hwRecordId = '', hwResultFilter = 'all', hwResultOpen = false, hwActiveTab = 'answer';
+
+    function hwUpdateUI() {
+        var el = document.getElementById('xyh-databar-text');
+        if (el) el.textContent = hwQuestionsData.length
+            ? '📡 已捕获 ' + hwQuestionsData.length + ' 题 · 可直接导出'
+            : '📡 未捕获作业数据 · 请先打开作业/试卷页面';
+    }
+
+    const domain = window.location.hostname;
+    function getCourseGroupId() { const match = window.location.href.match(/(?:mycourse|course)\/(\d+)/); return match ? match[1] : null; }
+    function getPaperId() {
+        // course_paper URL 两种代际结构：
+        //   新版: /course_paper/mycourse/{gid}/{nodeId}/{flowId}/{paperId}（paper 为末段）
+        //   旧版: /course_paper/mycourse/{gid}/{paperId}/{nodeId}
+        const nums = window.location.pathname.match(/course_paper\/mycourse\/\d+((?:\/\d+)+)$/);
+        if (nums && nums[1]) {
+            const parts = nums[1].split('/').filter(Boolean);
+            if (parts.length >= 3) return parts[parts.length - 1]; // 新结构：末段为 paperId
+            if (parts.length >= 1) return parts[0];                // 旧结构：首段为 paperId
+        }
+        let match = window.location.href.match(/resource\/(\d+)\/(\d+)/);
+        return match ? match[2] : null;
+    }
+    function getResourceNodeId() {
+        // 与 getPaperId 同一套代际判断：新结构 node=第1段；旧结构 node=第2段
+        const nums = window.location.pathname.match(/course_paper\/mycourse\/\d+((?:\/\d+)+)$/);
+        if (nums && nums[1]) {
+            const parts = nums[1].split('/').filter(Boolean);
+            if (parts.length >= 3) return parts[0];  // 新结构：首参数段为 nodeId
+            if (parts.length === 2) return parts[1]; // 旧结构：第2段为 nodeId
+            if (parts.length === 1) return '';
+        }
+        let match = window.location.href.match(/resource\/(\d+)\//);
+        return match ? match[1] : null;
+    }
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    function getCookie(keyword = 'prd-access-token') {
+        for (const cookie of document.cookie.split('; ')) {
+            const separatorIndex = cookie.indexOf('=');
+            if (separatorIndex < 0) continue;
+            const name = cookie.slice(0, separatorIndex);
+            if (name.includes(keyword)) return cookie.slice(separatorIndex + 1);
+        }
+        return null;
+    }
+    function hwCaptureParams(rawUrl) {
+        try {
+            const urlObj = new URL(rawUrl, window.location.origin);
+            hwGroupId = urlObj.searchParams.get('group_id') || hwGroupId;
+            hwNodeId = urlObj.searchParams.get('node_id') || hwNodeId;
+            hwPaperId = urlObj.searchParams.get('paper_id') || hwPaperId;
+        } catch(e) { console.warn('[小雅辅助] 无法解析作业请求参数', e); }
+    }
+
+    const _hw_nativeFetch = window.fetch.bind(window);
+    async function xyFetch(url, options = {}, timeoutMs = 15000) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try { return await fetch(url, { ...options, signal: controller.signal }); }
+        finally { clearTimeout(timer); }
+    }
+    async function xyNativeFetch(url, options = {}, timeoutMs = 15000) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try { return await _hw_nativeFetch(url, { ...options, signal: controller.signal }); }
+        finally { clearTimeout(timer); }
+    }
+
+    /* 响应拦截：独立脚本无全局 fetch 劫持，主动拉取的试卷响应在此直接解析入库
+       （主工具中该职责由 window.fetch 劫持链承担）。包装 xyFetch / xyNativeFetch。 */
+    var _xyhOrigXyFetch = xyFetch;
+    xyFetch = async function (url, options, timeoutMs) {
+        var res = await _xyhOrigXyFetch(url, options, timeoutMs);
+        try {
+            if (res && res.ok && String(url).includes('queryStuPaper')) {
+                var _d = await (res.clone ? res.clone() : res).json();
+                hwProcessPaperData(_d);
+            }
+        } catch (e) { console.error('[debug包装] 解析异常:', e && e.message); }
+        return res;
+    };
+    var _xyhOrigNative = xyNativeFetch;
+    xyNativeFetch = async function (url, options, timeoutMs) {
+        var res = await _xyhOrigNative(url, options, timeoutMs);
+        try {
+            if (res && res.ok && String(url).includes('queryStuPaper')) {
+                var _d2 = await (res.clone ? res.clone() : res).json();
+                hwProcessPaperData(_d2);
+            }
+        } catch (e) { /* 同上 */ }
+        return res;
+    };
+
+    function hwBuildTaskKey(gid, nid, pid) { return [gid||'', nid||'', pid||''].join(':'); }
+
+    function getNodeId() { const match = window.location.href.match(/resource\/\d+\/(\d+)/); return match ? match[1] : null; }
+
+    function hwExtractRecordId(payload) {
+        const direct=payload?.answer_record?.id||payload?.answer_record_id||payload?.record_id;
+        if(direct)return String(direct);
+        for(const list of [payload?.task_flow_record,payload?.task_flow_template]){
+            if(!Array.isArray(list))continue;
+            for(const item of list){
+                const recordId=item?.answer_record_id||item?.answer_record?.id||item?.record_id;
+                if(recordId)return String(recordId);
+            }
+        }
+        return '';
+    }
+    function hwSafeText(v) { return String(v??'').slice(0,32767); }
+    /** 作业域安全转数：Number() 结果有限才返回，否则 null（区别于概览域的 fallback-0 语义——这里 null 参与判空分支）。
+     * [DEEP-DOC]
+     */
+    function hwToNum(v) { const n=Number(v); return Number.isFinite(n)?n:null; }
+    /**
+     * 疑似 JSON 字符串惰性解析：trim 后非空、非纯数字才尝试 JSON.parse；
+     * 解析失败原样返回字符串。平台字段「有时是对象有时是序列化串」的双形态兼容。
+     * [DEEP-DOC]
+     */
+    function hwMaybeParse(v) { if(typeof v!=='string')return v; const t=v.trim(); if(!t||/^\d+$/.test(t))return v; try{return JSON.parse(t)}catch(e){return v}; }
+    /** 从 DraftJS 节点提取图片 src：entity data 直接携带或经 key 查 entityMap；兼容 file_access 协议与 data URI 两形态。
+     * [DEEP-DOC]
+     */
+    function hwGetImageSrc(data={}) {
+        const type=String(data.type||data.blockType||data.kind||"").toUpperCase();
+        return data.src||data.imageUrl||data.image_url||data?.data?.src||data?.data?.imageUrl||data?.data?.image_url||data?.data?.file||data?.data?.url||((type.includes("IMAGE")||type=="IMG")?(data.url||data.href||data.file||data?.data?.url||data?.data?.href||data?.data?.file||""):"");
+    }
+    /** LaTeX 公式原文提取：经 hwGetEntityByKey 取 MATH 实体的 formula/latex/tex 字段。
+     * [DEEP-DOC]
+     */
+    function hwGetFormula(data={}) { return data.teX||data.tex||data.latex||data.formula||data.value||data.content||data.text||data?.data?.teX||data?.data?.tex||data?.data?.latex||""; }
+    /** DraftJS entityMap 键查找：contentState.entityMap[key] 直取，缺失返回 undefined。
+     * [DEEP-DOC]
+     */
+    function hwGetEntityByKey(em,key) {
+        if(!em||typeof em!=="object")return null;
+        if(Object.prototype.hasOwnProperty.call(em,key))return em[key];
+        const sk=String(key);
+        if(sk!==String(key)&&Object.prototype.hasOwnProperty.call(em,sk))return em[sk];
+        return null;
+    }
+    /**
+     * 题目富文本统一解析器 —— 作业模块的数据入口汇合点。
+     *
+     * 三形态输入：DraftJS JSON 串（blocks+entityMap）/ 已解析对象 / 纯文本。
+     * 输出 { text, images[], segments[] }：text 为拼接纯文本（AI 提示词用）、
+     * images 收集全部图片 src（导出 docx 用）、segments 保序混合段
+     * （{type:'text'|'image'|'formula', value/src}，docx 还原排版顺序用）。
+     * 解析失败降级为单文本段，绝不抛出——题目展示不允许因单个坏题中断。
+     * [DEEP-DOC]
+     */
+    function hwParseRichContent(raw) {
+        if(!raw)return{text:"",images:[],segments:[]};
+        let obj=null;
+        if(typeof raw==="string"){try{obj=JSON.parse(raw)}catch(e){const t=raw.replace(/^"|"$/g,"").trim();return{text:t,images:[],segments:t?[{type:"text",value:t}]:[]}}}
+        else if(typeof raw==="object")obj=raw;
+        else{const t=String(raw).trim();return{text:t,images:[],segments:t?[{type:"text",value:t}]:[]}}
+        if(!obj||!Array.isArray(obj.blocks)){
+            /* dist 附件数组作答（手写/上传图片）：[{type:'dist',name,quote_id,mimetype,...}]
+               → 逐项转为 image 段（quote_id 经 cloud/file_access 拉取）。 */
+            if(Array.isArray(obj)){
+                const imgs=[],segs=[];
+                obj.forEach(it=>{if(it&&it.quote_id){segs.push({type:"image",src:window.location.origin+"/api/jx-oresource/cloud/file_access/"+it.quote_id});imgs.push({src:"/api/jx-oresource/cloud/file_access/"+it.quote_id,kind:"image"})}});
+                if(segs.length)return{text:imgs.map(x=>"[图片]").join(""),images:imgs,segments:segs};
+            }
+            const t=typeof obj==="string"?obj.trim():(typeof raw==="string"?raw.trim():JSON.stringify(raw));return{text:t,images:[],segments:t?[{type:"text",value:t}]:[]}}
+        const parts=[],images=[],segs=[],em=obj.entityMap||{};
+        const pt=(t)=>{const c=String(t||"").trim();if(c){parts.push(c);segs.push({type:"text",value:c})}};
+        const pi=(s)=>{if(!s)return;parts.push("[图片]");images.push({src:s,kind:"image"});segs.push({type:"image",src:s})};
+        const pf=(f)=>{const c=String(f||"").trim();if(c){parts.push("[公式: "+c+"]");segs.push({type:"formula",value:c})}};
+        const hd=(d)=>{if(!d)return;const t=String(d.type||"").toUpperCase();if(t.includes("IMAGE")||t=="IMG"||d.src||d.imageUrl||d.image_url||d.file||(d&&d.data&&(d.data.src||d.data.imageUrl||d.data.image_url||d.data.file||d.data.url)))pi(hwGetImageSrc(d));else if(t.includes("TEX")||t.includes("MATH")||t.includes("FORMULA"))pf(hwGetFormula(d))};
+        obj.blocks.forEach(b=>{if(!b)return;if(b.type==="atomic"&&b.data){hd(b.data);return}pt(b.text);if(Array.isArray(b.entityRanges))b.entityRanges.forEach(r=>{const e=hwGetEntityByKey(em,r?.key);if(e&&e.data)hd({...e.data,type:e.type||e.data.type})})});
+                return{text:parts.join("\n").trim(),images,segments:segs.length?segs:(parts.length?[{type:"text",value:parts.join("\n").trim()}]:[])}
+    }
+    /** 图片资产登记：把解析出的 images 追加进模块级 hwImageAssets 数组（附题目序号
+     * 与可选选项字母定位），供 hwHydrateImageMap 批量下载。去重靠后续 Set 化。
+     * [DEEP-DOC]
+     */
+    function hwCollectImages(qi,parsed,optL) { if(!parsed||!Array.isArray(parsed.images))return; parsed.images.forEach(im=>{if(!im.src)return;if(!hwImageAssets.some(a=>a.qi===qi&&a.src===im.src&&a.optL===optL))hwImageAssets.push({qi,src:im.src,optL})})}
+    /** 平台题型代码 → 中文标签映射：1 单选 / 2 多选 / 4 填空 / 5 判断 / 6 简答 /
+     * 7 附件 / 13 匹配 / 9 组合子题；未知码兜底「未知题型」。
+     * [DEEP-DOC]
+     */
+    function hwTypeLabel(t) { return {1:'[单选题]',2:'[多选题]',4:'[填空题]',5:'[判断题]',6:'[简答题]',7:'[附件题]',9:'[组合题]',13:'[匹配题]'}[t]||'[其他]' }
+    /** answer_items 排序复用：answer_items_sort 逗号 id 序 → 重排 sItems（无 sort 原序返回）。
+     * [DEEP-DOC]
+     */
+    function hwSortAnswerItems(q) {
+        let sItems = Array.isArray(q.answer_items) ? [...q.answer_items] : [];
+        if (q.answer_items_sort && Array.isArray(q.answer_items)) {
+            const si = String(q.answer_items_sort).split(',');
+            sItems = si.map(id => q.answer_items.find(it => String(it.id) === String(id))).filter(Boolean);
+        }
+        return sItems;
+    }
+    /** 富文本答案 → 纯文本：hwMaybeParse 后走 blocks 拼接或直接 String。填空比对与结果展示共用。
+     * [DEEP-DOC]
+     */
+    function hwExtractPlainText(v) {
+        if(v===null||v===undefined)return'';
+        const p=hwMaybeParse(v);
+        if(p&&typeof p==='object'&&Array.isArray(p.blocks))return p.blocks.map(b=>b?.text||'').join('\n').trim();
+        if(Array.isArray(p))return p.map(hwExtractPlainText).filter(Boolean).join('；');
+        if(p&&typeof p==='object')return Object.values(p).map(hwExtractPlainText).filter(Boolean).join('；');
+        return String(p).trim();
+    }
+    /** 富文本答案 → 展示 HTML：blocks 逐段还原段落与图片占位，供结果面板 innerHTML 渲染。
+     * [DEEP-DOC]
+     */
+    function hwExtractRichDisplay(v) {
+        if(v===null||v===undefined||v==='')return'';
+        const p=hwParseRichContent(v);
+        return p.text||hwExtractPlainText(v);
+    }
+    /** 答案项 ID 归一：String() 统一数字/字符串混型，保证作答回填时的键匹配稳定。
+     * [DEEP-DOC]
+     */
+    function hwNormalizeAnswerIds(a) {
+        if(Array.isArray(a))return a.map(x=>String(x).trim()).filter(Boolean);
+        if(a===null||a===undefined)return[];
+        const p=hwMaybeParse(a);
+        if(Array.isArray(p))return p.map(x=>String(x).trim()).filter(Boolean);
+        return String(p).split(/[,，、\s]+/).map(x=>x.trim()).filter(Boolean);
+    }
+    /** 选择题格式化：answerChecked===2 判定正确项；输出「字母. 文本」列表，标准答案存在时标注 ✓。
+     * [DEEP-DOC]
+     */
+    function hwFormatChoice(qData,answer) {
+        const ids=hwNormalizeAnswerIds(answer);if(!ids.length)return'无记录';
+        return ids.map(id=>{const o=qData.options?.find(x=>String(x.id)===String(id));if(!o)return id;const t=o.text?' '+o.text:'';return o.letter+'.'+t}).join('；');
+    }
+    /** 填空题格式化：sItems 序号对应答案数组逐空展示「空N：内容」，缺答显示空位。
+     * [DEEP-DOC]
+     */
+    function hwFormatFill(qData,answer) {
+        const p=hwMaybeParse(answer);
+        if(!p||typeof p!=='object'||Array.isArray(p)){const t=hwExtractPlainText(answer);return t||'无记录';}
+        const parts=(qData.sItems||[]).map((it,i)=>{const v=hwExtractPlainText(p[it.id]);return'空'+(i+1)+'：'+(v||'未填')});
+        return parts.length?parts.join('；'):'无记录';
+    }
+    /** 匹配题格式化：左右项按 id 配对输出「左项 → 右项」行序列。
+     * [DEEP-DOC]
+     */
+    function hwFormatMatching(qData,answer) {
+        const p=hwMaybeParse(answer);const l=qData.matchingLeftItems||[],r=qData.matchingRightItems||[];
+        if(!p||typeof p!=='object'||Array.isArray(p)){const t=hwExtractPlainText(answer);return t||'无记录';}
+        const rm=new Map(r.map(x=>[String(x.id),x]));let has=false;
+        const lines=l.map(li=>{const rv=p[li.id]??p[String(li.id)];const rids=hwNormalizeAnswerIds(rv);if(!rids.length)return li.letter+'. '+(li.text||'')+' => 未匹配';has=true;const rt=rids.map(id=>{const ri=rm.get(String(id));return ri?ri.letter+'. '+(ri.text||''):id}).join('、');return li.letter+'. '+(li.text||'')+' => '+rt});
+        return has?lines.join('\n'):'无记录';
+    }
+    /** 作答内容总分发：按 qData.type 路由到 choice(1,2,5)/fill(4)/matching(13)/
+     * rich(6)/附件(7 占位)；未知类型显示原始 JSON 截断。
+     * [DEEP-DOC]
+     */
+    function hwFormatAnswer(qData,answer) {
+        if(!qData)return hwExtractPlainText(answer)||'无记录';
+        if(qData.type===1||qData.type===2||qData.type===5)return hwFormatChoice(qData,answer);
+        if(qData.type===4)return hwFormatFill(qData,answer);
+        if(qData.type===6)return hwExtractRichDisplay(answer)||'无记录';
+        if(qData.type===7)return'附件题';
+        if(qData.type===13)return hwFormatMatching(qData,answer);
+        return hwExtractPlainText(answer)||'无记录';
+    }
+    /** 标准答案提取（仅平台发布答案后下发）：优先 question.std_answer，兼容 answer 字段。
+     * [DEEP-DOC]
+     */
+    function hwGetStdAnswer(qData,canShow) {
+        if(!canShow||!qData)return'';
+        if(qData.type===1||qData.type===2||qData.type===5){const co=(qData.options||[]).filter(o=>o.answerChecked===2);return co.map(o=>{const t=o.text?' '+o.text:'';return o.letter+'.'+t}).join('；')||''}
+        if(qData.type===4){const parts=(qData.sItems||[]).map((it,i)=>{const v=hwExtractPlainText(it.answer);return v?'空'+(i+1)+'：'+v:''}).filter(Boolean);return parts.join('；')}
+        if(qData.type===6&&(qData.sItems||[])[0])return hwExtractRichDisplay(qData.sItems[0].answer);
+        return'';
+    }
+    /**
+     * 单题批改状态机：correct===2 或满分 → ok 正确；score>0 → partial 部分；
+     * correct===1 或零分 → bad 错误；有记录无成绩 → pending 待批改；无记录 →
+     * muted 未作答。输出 {label, tone}，tone 驱动结果面板配色与筛选键。
+     * [DEEP-DOC]
+     */
+    function hwGetResultState(a,qd) {
+        if(!a)return{label:'无记录',tone:'muted'};
+        const s=hwToNum(a.score),c=hwToNum(a.correct),fs=hwToNum(qd?.score);
+        if(c===2||(s!==null&&fs!==null&&fs>0&&s>=fs))return{label:'正确',tone:'ok'};
+        if(s!==null&&s>0)return{label:'部分得分',tone:'partial'};
+        if(c===1||(s!==null&&s===0))return{label:'错误',tone:'bad'};
+        return{label:'待批改',tone:'pending'};
+    }
+    /**
+     * 提交结果装配器：answer_record 缺失/answers 空数组 → waiting/not_submitted
+     * 早退；status!==2 → not_submitted（有记录未交）；否则 submitted 态：
+     * canShowStandardAnswer 由 publish_record.is_show_answer 决定、totalScore/
+     * actualScore/answerNum 收敛、逐题 questionResults 经 GetResultState 构建。
+     * [DEEP-DOC]
+     */
+    function hwBuildSubmissionResult(pd) {
+        const ar=pd?.answer_record,answers=ar?.answers;
+        if(!ar||!Array.isArray(answers)||!answers.length)return{state:hwQuestionsData.length?'not_submitted':'waiting',message:hwQuestionsData.length?'未检测到已提交作业记录。':'等待题目数据加载...'};
+        if(Number(ar.status)!==2)return{state:'not_submitted',message:'检测到作答记录，但当前任务尚未确认。'};
+        const canShow=pd?.publish_record?.is_show_answer===true;
+        const am=new Map(answers.map(a=>[String(a.question_id),a]));
+        const qrs=hwQuestionsData.map(qd=>{const a=am.get(String(qd.id));const rs=hwGetResultState(a,qd);const s=hwToNum(a?.score),fs=hwToNum(qd.score);const st=s!==null?`${s} / ${fs!==null?fs:'-'} 分`:`- / ${fs!==null?fs:'-'} 分`;return{index:qd.index,id:qd.id,type:qd.type,typeLabel:hwTypeLabel(qd.type),title:qd.titleText,stateLabel:rs.label,tone:rs.tone,scoreText:st,userAnswer:hwFormatAnswer(qd,a?.answer),rawUserAnswer:a?.answer,standardAnswer:hwGetStdAnswer(qd,canShow)}});
+        return{state:'submitted',canShowStandardAnswer:canShow,totalScore:hwToNum(pd?.total_score),actualScore:hwToNum(ar.actual_score??ar.score),answerNum:hwToNum(ar.answer_num||hwQuestionsData.length),correctNum:hwToNum(ar.answer_correct_num),questionResults:qrs};
+    }
+
+    
+    let _hwDataJustLoaded = false;
+    /**
+     * 试卷归属校验（防串包闸门）：payloadGroupId 存在且与当前路由课程不符 → false；
+     * payloadPaperId 与 getPaperId()/已捕获 hwPaperId 均无法对上 → false。
+     * 后台预加载的其他试卷响应在此被拦截，不会污染当前答题会话。
+     * [DEEP-DOC]
+     */
+    function hwIsCurrentPaperPayload(json) {
+        const payloadGroupId = json?.data?.group_id;
+        const currentGroupId = getCourseGroupId();
+        if (payloadGroupId && currentGroupId && String(payloadGroupId) !== String(currentGroupId)) return false;
+        const payloadPaperId = json?.data?.paper_id || json?.data?.paperId || json?.data?.id;
+        if (!payloadPaperId) return true;
+        /* 新版 resource 作业页：URL 末段是资源节点 ID，真卷 ID 是内层 quote/资源 id，
+           两者不同但都属于本卷。课程内守卫已足够拦截串包（载荷 group_id 必须与当前
+           课程一致），paper_id 只在双 ID 都已知且都匹配不上时才拒收。 */
+        if (hwPaperId && String(payloadPaperId) === String(hwPaperId)) return true;
+        const urlPaperId = getPaperId();
+        if (urlPaperId && String(payloadPaperId) === String(urlPaperId)) return true;
+        /* 放宽兜底：URL 是 resource/{dir}/{paperNode} 作业页形态时，直接信任课程守卫，
+           不因 paper_id 形态差异丢弃（防脚本启动早期 hwPaperId 未定值时误杀） */
+        if (/resource\/\d+\/\d+/.test(window.location.href) && !window.location.href.includes('/course_paper/')) return true;
+        return false;
+    }
+    /**
+     * 题目数据主处理器 —— 作业模块的心脏。
+     *
+     * 管线五级：
+     *   1. 结构守卫：json/data/questions 三层存在性 + Array.isArray 类型校验
+     *      （畸形载荷 warn 后优雅 return，绝不抛出打断页面）；
+     *   2. 归属守卫：hwIsCurrentPaperPayload 拦过期试卷；
+     *   3. 元数据补齐：paper/group/node/record 四 ID 就位（已有值不覆盖）；
+     *   4. 逐题清洗 forEach：题型分流——选择类分配字母、填空计空数、匹配题
+     *      左右分列、附件标记免答；每题走 ParseRichContent 三元组解析 + 图片收集；
+     *      同时拼 AI 提示词模板 tpl（含内容格式说明头）；
+     *   5. 收尾：hwActiveTaskKey 固化 → BuildSubmissionResult → 非 dashboard
+     *      钉住场景自动切作业区 → hwUpdateUI 全量刷新。
+     *
+     * 副作用：重置并重建 hwQuestionsData/hwImageAssets/hwPdfQuestions 三大数组。
+     * [DEEP-DOC]
+     */
+
+    function hwProcessPaperData(json) {
+        if(!json||!json.data||!Array.isArray(json.data.questions)){console.warn('[小雅辅助·作业区] 题目数据结构不完整，已跳过处理',!!json,!!json?.data,!!json?.data?.questions);return;}
+        if (!hwIsCurrentPaperPayload(json)) {
+            console.warn('[小雅辅助·作业区] 已忽略过期课程的题目响应');
+            return;
+        }
+        clearTimeout(window._hwResetGuard);
+        _hwDataJustLoaded = true;
+        setTimeout(() => { _hwDataJustLoaded = false; }, 3000);
+        console.log('[小雅辅助·作业区] 开始处理题目数据，题目数:', json.data.questions.length);
+        hwPaperId=hwPaperId||json.data.paper_id||json.data.paperId||json.data.id||'';
+        if(!hwGroupId)hwGroupId=json.data.group_id;
+        if(!hwNodeId)hwNodeId=getNodeId()||'';
+        hwRecordId=hwRecordId||hwExtractRecordId(json.data);
+        const qs=json.data.questions;
+        hwQuestionsData=[];hwImageAssets=[];hwPdfQuestions=[];
+        let tpl='📌 学习任务单\n按下列题目整理要点，只输出内容本身，不要附带解析或任何说明文字。\n【答案格式】\n单选/判断 → 题号 => 大写字母（如 1 => A）\n多选 → 题号 => 字母，逗号分隔（如 2 => A,C）\n填空 → 题号 => 各空用竖线分隔（如 3 => const | let）\n简答 → 题号 => 完整文字\n匹配 → 题号 => 左:右（如 10 => A:a,d | B:b,c）\n附件题无作答内容。\n\n════════════════════\n以下为题目内容：\n════════════════════\n';
+        qs.forEach((q,idx)=>{
+            /* 组合题（type 9）：大题干 + subQuestions[] 子题，作答记录按子题 id 拍平。
+               按用户约定展开为 1.1 / 1.2 独立条目；大题干并入每道子题标题前，保证
+               单看一道子题也能读懂题意。若平台未下发子题则退化为普通题处理。 */
+            if (q.type === 9 && Array.isArray(q.subQuestions) && q.subQuestions.length) {
+                const qBase = (idx + 1) + '';            // 大题号（1）
+                const pt0 = hwParseRichContent(q.title);
+                const stem = pt0.text;                    // 大题干
+                pt0.images.forEach(im => { if (im.src) hwImageAssets.push({ qi: idx + 1, src: im.src, optL: '' }); });
+                q.subQuestions.forEach((sq, si) => {
+                    const qi = idx + 1;                   // 图片归集沿用大题号
+                    const label = qBase + '.' + (si + 1); // 1.1 / 1.2
+                    const pt = hwParseRichContent(sq.title);
+                    const fullTitle = (stem ? stem + '　' : '') + pt.text;
+                    const sItems = hwSortAnswerItems(sq);
+                    /* 每道子题都是独立条目：完整携带大题干段（含图片段），
+                       手写/导出时每道子题旁都有题图可对照（同图去重由 imgList 保证） */
+                    const stemSegs = pt0.segments && pt0.segments.length ? pt0.segments : (stem ? [{ type: 'text', value: stem + '　' }] : []);
+                    const pq = { index: label, type: sq.type, typeLabel: hwTypeLabel(sq.type),
+                        titleSegments: stemSegs.concat(pt.segments && pt.segments.length ? pt.segments : (pt.text ? [{ type: 'text', value: pt.text }] : [])),
+                        options: [], matchingLeftItems: [], matchingRightItems: [], blankCount: sItems.length };
+                    const rOpts = [], mLeft = [], mRight = [];
+                    hwCollectImages(qi, pt);
+                    let line = label + ' ' + hwTypeLabel(sq.type) + '\n' + (stem ? stem + '\n' : '') + pt.text + '\n';
+                    const subLike = { index: label, id: sq.id, type: sq.type, score: sq.score, titleText: fullTitle, options: rOpts, matchingLeftItems: mLeft, matchingRightItems: mRight, sItems, parentIndex: idx + 1, subLabel: label };
+                    if (sq.type === 1 || sq.type === 2 || sq.type === 5) {
+                        let lc = 65;
+                        sItems.forEach(opt => {
+                            const ol = String.fromCharCode(lc++);
+                            const po = hwParseRichContent(opt.value);
+                            let ot = po.text;
+                            hwCollectImages(qi, po, ol);
+                            if (sq.type === 5 && !ot) ot = ol === 'A' ? '正确' : '错误';
+                            pq.options.push({ letter: ol, text: ot, segments: po.segments && po.segments.length ? po.segments : (ot ? [{ type: 'text', value: ot }] : []) });
+                            rOpts.push({ id: opt.id, letter: ol, text: ot, answerChecked: opt.answer_checked });
+                            line += '   ' + ol + '. ' + ot + '\n';
+                        });
+                    } else if (sq.type === 4) {
+                        line += '   (本题共 ' + sItems.length + ' 个填空)\n';
+                    } else if (sq.type === 7) {
+                        line += '   附件题无需回答。\n';
+                    } else if (sq.type === 13) {
+                        const li = sItems.filter(it => it && it.is_target_opt !== true), ri = sItems.filter(it => it && it.is_target_opt === true);
+                        line += '   左侧：\n';
+                        li.forEach((opt, ii) => {
+                            const ol = String.fromCharCode(65 + ii);
+                            const po = hwParseRichContent(opt.value);
+                            hwCollectImages(qi, po, ol);
+                            const d = { id: opt.id, letter: ol, text: po.text, segments: po.segments && po.segments.length ? po.segments : (po.text ? [{ type: 'text', value: po.text }] : []) };
+                            mLeft.push(d); pq.matchingLeftItems.push(d); line += '   ' + ol + '. ' + po.text + '\n';
+                        });
+                        line += '\n   右侧候选：\n';
+                        ri.forEach((opt, ii) => {
+                            const ol = String.fromCharCode(97 + ii);
+                            const po = hwParseRichContent(opt.value);
+                            hwCollectImages(qi, po, ol);
+                            const d = { id: opt.id, letter: ol, text: po.text, segments: po.segments && po.segments.length ? po.segments : (po.text ? [{ type: 'text', value: po.text }] : []) };
+                            mRight.push(d); pq.matchingRightItems.push(d); line += '   ' + ol + '. ' + po.text + '\n';
+                        });
+                    }
+                    tpl += line + '\n';
+                    hwQuestionsData.push(subLike);
+                    hwPdfQuestions.push(pq);
+                });
+                return;
+            }
+            /* 普通题（1/2/4/5/6/7/13）：原有路径 */
+            const qi=idx+1;const pt=hwParseRichContent(q.title);let qTitle=pt.text;let qType=hwTypeLabel(q.type);const rOpts=[],mLeft=[],mRight=[];hwCollectImages(qi,pt);tpl+=qi+'. '+qTitle+' '+qType+'\n';
+        let sItems=Array.isArray(q.answer_items)?[...q.answer_items]:[];if(q.answer_items_sort&&Array.isArray(q.answer_items)){const si=String(q.answer_items_sort).split(',');sItems=si.map(id=>q.answer_items.find(it=>String(it.id)===String(id))).filter(Boolean)}
+        const pq={index:qi,type:q.type,typeLabel:qType,titleSegments:pt.segments&&pt.segments.length?pt.segments:(qTitle?[{type:'text',value:qTitle}]:[]),options:[],matchingLeftItems:[],matchingRightItems:[],blankCount:sItems.length};
+        if(q.type===1||q.type===2||q.type===5){let lc=65;sItems.forEach(opt=>{const ol=String.fromCharCode(lc);const po=hwParseRichContent(opt.value);let ot=po.text;hwCollectImages(qi,po,ol);if(q.type===5&&!ot)ot=ol==='A'?'正确':'错误';pq.options.push({letter:ol,text:ot,segments:po.segments&&po.segments.length?po.segments:(ot?[{type:'text',value:ot}]:[])});rOpts.push({id:opt.id,letter:ol,text:ot,answerChecked:opt.answer_checked});tpl+='   '+ol+'. '+ot+'\n';lc++})}
+        else if(q.type===4)tpl+='   (本题共 '+sItems.length+' 个填空)\n';
+        else if(q.type===7)tpl+='   附件题无需回答。\n';
+        else if(q.type===13){const li=sItems.filter(it=>it&&it.is_target_opt!==true),ri=sItems.filter(it=>it&&it.is_target_opt===true);tpl+='   左侧：\n';li.forEach((opt,ii)=>{const ol=String.fromCharCode(65+ii);const po=hwParseRichContent(opt.value);const ot=po.text,segs=po.segments&&po.segments.length?po.segments:(ot?[{type:'text',value:ot}]:[]);hwCollectImages(qi,po,ol);const d={id:opt.id,letter:ol,text:ot,segments:segs};mLeft.push(d);pq.matchingLeftItems.push(d);tpl+='   '+ol+'. '+ot+'\n'});tpl+='\n   右侧候选：\n';ri.forEach((opt,ii)=>{const ol=String.fromCharCode(97+ii);const po=hwParseRichContent(opt.value);const ot=po.text,segs=po.segments&&po.segments.length?po.segments:(ot?[{type:'text',value:ot}]:[]);hwCollectImages(qi,po,ol);const d={id:opt.id,letter:ol,text:ot,segments:segs};mRight.push(d);pq.matchingRightItems.push(d);tpl+='   '+ol+'. '+ot+'\n'})}
+        tpl+='\n';hwQuestionsData.push({index:qi,id:q.id,type:q.type,score:q.score,titleText:qTitle,options:rOpts,matchingLeftItems:mLeft,matchingRightItems:mRight,sItems});hwPdfQuestions.push(pq)});
+        hwExtractedText=tpl;hwActiveTaskKey=hwBuildTaskKey(hwGroupId,hwNodeId,hwPaperId);hwSubmissionResult=hwBuildSubmissionResult(json.data);hwActiveTab='answer';
+        console.log('[小雅辅助·作业区] 数据清洗完毕：', hwQuestionsData.length, '题,', hwImageAssets.length, '图, 已提交:', hwSubmissionResult.state);
+                hwUpdateUI();
+        hwUpdateUI();
+    }
+
+    
+    let _hwProactiveFetching = false;
+    /**
+     * 主动拉题管线（截包失效时的补救通道）。
+     *
+     * URL 参数三参补齐（searchParams → 全局提取函数回退）后分流：
+     *   resource 页形态 → queryResource/v3 单次请求，questions 数组展开子题
+     *     （type=9 组合题的 subQuestions 平铺并标 _parentId）后走主处理器；
+     *   course_paper 形态 → queryStuPaper/v2 指数退避轮询 6 次（200ms×2^n）,
+     *     依赖劫持链在响应到达时自动处理（本函数只负责触发请求），轮询结束
+     *     仍未拿到则放弃并 warn。
+     * _hwProactiveFetching 重入门防并发重复拉取。
+     * [DEEP-DOC]
+     */
+    let _hwProactiveNextAt = 0;
+
+    async function hwProactiveFetchData() {
+        if (_hwProactiveFetching) return;
+        if (hwQuestionsData.length > 0) return;
+        /* 失败节流：上一轮拉取未拿到题目时至少间隔 10s 再试，
+           防止 scanner 每秒重入造成接口风暴（实测旧版曾 40+ 次连发） */
+        if (Date.now() < _hwProactiveNextAt) return;
+        try {
+            const urlObj = new URL(window.location.href);
+            let groupId = urlObj.searchParams.get('group_id');
+            let nodeId = urlObj.searchParams.get('node_id');
+            let paperId = urlObj.searchParams.get('paper_id');
+            
+            if (!groupId || !nodeId || !paperId) {
+                if (!groupId) groupId = getCourseGroupId();
+                if (!nodeId) nodeId = getResourceNodeId();
+                if (!paperId) paperId = getPaperId();
+            }
+            
+            const isResourcePage = window.location.href.includes('/resource/') && !window.location.href.includes('/course_paper/');
+            if (isResourcePage && groupId && paperId) {
+                _hwProactiveFetching = true;
+                try {
+                    const token = getCookie();
+                    if (!token) { _hwProactiveFetching = false; return; }
+                    /* 新版作业页数据链（实测）：resource/{gid}/{dirId}/{paperNodeId} →
+                       ① queryResource/v3?node_id={paperNodeId} 取 resource.id(真卷 quote_id)
+                       ② survey/course/queryStuPaper/v2?paper_id={quote_id}&group_id&node_id={paperNodeId}
+                         一次拿全 questions + answer_record（批改状态） */
+                    const resUrl = `https://${domain}/api/jx-iresource/resource/queryResource/v3?node_id=${encodeURIComponent(paperId)}`;
+                    console.log('[小雅辅助·作业区] resource 页面用 queryResource/v3');
+                    const res = await xyNativeFetch(resUrl, { headers: { 'Authorization': `Bearer ${token}` } }, 30000);
+                    const data = await res.json();
+                    if (data && data.success && data.data && data.data.resource && Array.isArray(data.data.resource.questions)) {
+                        const questions = data.data.resource.questions;
+                        console.log('[小雅辅助·作业区] queryResource/v3 获取到题目:', questions.length, '题');
+                        const paperIdFromRes = data.data.resource.id || paperId;
+                        hwGroupId = groupId;
+                        hwNodeId = paperId;
+                        hwPaperId = String(paperIdFromRes);
+                        // 优先走正式试卷接口：题目+作答记录一次拿全（queryResource/v3 无 answer_record）
+                        try {
+                            const stuUrl = `https://${domain}/api/jx-iresource/survey/course/queryStuPaper/v2?paper_id=${encodeURIComponent(paperIdFromRes)}&group_id=${encodeURIComponent(groupId)}&node_id=${encodeURIComponent(paperId)}`;
+                            const stuRes = await xyNativeFetch(stuUrl, { headers: { 'Authorization': `Bearer ${token}` } }, 45000);
+                            const stuData = await stuRes.json();
+                            if (stuData && stuData.success && stuData.data && Array.isArray(stuData.data.questions)) {
+                                console.log('[小雅辅助·作业区] survey/course/queryStuPaper/v2 获取到完整试卷数据');
+                                hwProcessPaperData(stuData);
+                                _hwProactiveFetching = false;
+                                return;
+                            }
+                            console.warn('[小雅辅助·作业区] survey 接口无 questions，回退 queryResource 组包');
+                        } catch(e) { console.warn('[小雅辅助·作业区] survey 接口失败，回退 queryResource 组包:', e); }
+
+                        // 子题平铺：type=9 组合题的 subQuestions 展开并标 _parentId
+                        const allQuestions = [];
+                        questions.forEach(q => {
+                            allQuestions.push(q);
+                            if (q.type === 9 && Array.isArray(q.subQuestions)) {
+                                q.subQuestions.forEach(sq => { sq._parentId = q.id; allQuestions.push(sq); });
+                            }
+                        });
+
+                        // 归属校验已在 hwIsCurrentPaperPayload 内做双 ID 白名单（URL 末段+内层卷 ID），无需临时包装
+                        try {
+                            const compatData = {
+                                data: {
+                                    paper_id: paperIdFromRes,
+                                    group_id: groupId,
+                                    questions: allQuestions,
+                                    answer_record: data.data.answer_record || null
+                                }
+                            };
+                            hwGroupId = groupId;
+                            hwPaperId = String(paperIdFromRes);
+                            hwProcessPaperData(compatData);
+                        } catch(e) { console.warn('[小雅辅助·作业区] compatData 组包失败:', e); }
+                        _hwProactiveFetching = false;
+                        return;
+                    }
+                    console.warn('[小雅辅助·作业区] queryResource/v3 返回值无 questions');
+                } catch(e) {
+                    console.warn('[小雅辅助·作业区] queryResource/v3 失败:', e);
+                }
+                _hwProactiveFetching = false;
+                return;
+            }
+            if (!groupId || !nodeId || !paperId) {
+                console.log('[小雅辅助·作业区] 主动拉取参数缺失:', { groupId, nodeId, paperId });
+                return;
+            }
+            _hwProactiveFetching = true;
+            hwGroupId = groupId;
+            hwNodeId = nodeId;
+            hwPaperId = paperId;
+            console.log('[小雅辅助·作业区] 主动拉取参数:', { groupId, nodeId, paperId, isResourcePage: window.location.href.includes('/resource/') });
+            const token = getCookie();
+            if (!token) { _hwProactiveFetching = false; return; }
+            
+            let data = null;
+            for (let attempt = 0; attempt < 6; attempt++) {
+                if (hwQuestionsData.length > 0) { data = true; break; }
+                try {
+                const url = `https://${domain}/api/jx-iresource/survey/course/queryStuPaper/v2?paper_id=${encodeURIComponent(paperId)}&group_id=${encodeURIComponent(groupId)}&node_id=${encodeURIComponent(nodeId)}`;
+
+                    const res = await xyFetch(url, { headers: { 'Authorization': `Bearer ${token}` } }, 45000);
+                    if (!res.ok) console.warn(`[小雅辅助·作业区] 试卷接口返回异常状态 ${res.status}(第${attempt + 1}次)`);
+                } catch(e) { console.warn(`[小雅辅助·作业区] 试卷接口请求失败(第${attempt + 1}次):`, e); }
+                if (hwQuestionsData.length > 0) { data = true; break; } 
+                if (attempt < 5) await sleep(200 * Math.pow(2, attempt)); 
+            }
+            if (data) {
+                console.log('[小雅辅助·作业区] 主动拉取题目数据成功');
+                if (hwQuestionsData.length > 0 && hwSubmissionResult.state === 'waiting') {
+                    hwSubmissionResult.state = 'not_submitted';
+                    hwUpdateUI();
+                }
+            } else {
+                console.warn('[小雅辅助·作业区] 主动拉取未获得到题目数据（6次重试后放弃）');
+            }
+        } catch(e) {
+            console.warn('[小雅辅助·作业区] 主动拉取题目数据失败', e);
+        } finally {
+            _hwProactiveFetching = false;
+            if (hwQuestionsData.length === 0) _hwProactiveNextAt = Date.now() + 10000;
+        }
+    }
+    /**
+     * 图片尺寸探测：Blob → objectURL → Image onload 读 natural 尺寸 → revoke。
+     * onerror reject「无法获取图片尺寸」。用于 docx 中按原始宽高比缩放排版。
+     * [DEEP-DOC]
+     */
+
+    function hwGetImageSize(ab){return new Promise((resolve,reject)=>{const blob=new Blob([ab]);const url=URL.createObjectURL(blob);const img=new Image();img.onload=()=>{const d={width:img.width,height:img.height};URL.revokeObjectURL(url);resolve(d)};img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('无法获取图片尺寸'))};img.src=url})}
+    /**
+     * 平台图片二进制拉取：从 src 解析 file_access/{id} 段 → 拼 cloud/file_access
+     * API（random 时间戳防缓存）→ GET arrayBuffer。非 2xx 抛业务错误。
+     * [DEEP-DOC]
+     */
+    async function hwFetchImageBlob(src){var s=String(src||'').trim();if(!s)throw new Error("图片地址为空");
+      if(s.startsWith("data:")){var m=/^data:[^,]*,([\s\S]*)$/.exec(s);if(!m)throw new Error("无法解析 data URI");var payload=m[1];var bytes;if(/;base64/i.test(s.slice(0,s.indexOf(',')))){var bin=atob(payload);bytes=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i)}else{bytes=new TextEncoder().encode(decodeURIComponent(payload))}return bytes.buffer}
+      if(s.startsWith("http")||s.startsWith("/")){var rd=await xyFetch(s,{method:"GET"},45000);if(!rd.ok)throw new Error("图片请求失败:"+rd.status);return await rd.arrayBuffer()}
+      var p=s.indexOf("file_access/");if(p===-1)throw new Error("无法解析图片ID");
+      var id=s.substring(p+12).split(/[?/]/)[0];
+      var url=window.location.origin+"/api/jx-oresource/cloud/file_access/"+id+"?random="+Date.now();
+      var r=await xyFetch(url,{method:"GET"},45000);if(!r.ok)throw new Error("图片请求失败:"+r.status);return await r.arrayBuffer()}
+    /** 并发受限映射（与 xyCourseDashboardMapLimit 同构）：固定 worker 池共享游标，保序输出。图片下载限制 3 路防打爆接口。
+     * [DEEP-DOC]
+     */
+    async function hwMapLimit(list,limit,worker){const res=new Array(list.length);let c=0;const runners=Array.from({length:Math.min(limit,list.length)},async()=>{while(c<list.length){const i=c++;res[i]=await worker(list[i],i)}});await Promise.all(runners);return res}
+    /**
+     * 图片批量水合：全部 src 去重 → hwMapLimit(3) 逐张 FetchImageBlob +
+     * GetImageSize（超宽 450px 等比缩放排版尺寸）→ 产出 Map<src,{ok,arrayBuffer,
+     * width,height}>。单张失败不拖垮整体，错误记录在条目内供 docx 渲染降级。
+     * [DEEP-DOC]
+     */
+    async function hwHydrateImageMap(extra, maxW, includeAssets){const list=(extra||[]).map(a=>typeof a==='string'?{src:a}:a);const all=[...(includeAssets===false?[]:hwImageAssets),...list];const us=Array.from(new Set(all.map(a=>a&&a.src).filter(Boolean)));if(!us.length)return new Map();const cap=Math.max(120,(maxW||450));const results=await hwMapLimit(us,3,async src=>{try{const ab=await hwFetchImageBlob(src);let w=300,h=180;try{const d=await hwGetImageSize(ab.slice(0));if(d.width&&d.height){w=d.width;h=d.height;if(w>cap){h=Math.round(h*(cap/w));w=cap}}}catch(e){}return{src,ok:true,arrayBuffer:ab,width:w,height:h}}catch(e){return{src,ok:false,error:e?.message||String(e)}}});const m=new Map();results.forEach(r=>m.set(r.src,r));return m}
+    /**
+     * 图文段序列 → docx Paragraph[]：text 段累积 TextRun 后 flush（相邻文本合并
+     * 减少段落数）；image 段查 imMap 成功则 ImageRun（缩放后尺寸）失败插入灰色
+     * 占位文字；formula 段斜体「[公式: ...]」占位（docx 不支持原生 LaTeX）。
+     * indentLvl 控制选项级缩进（240 twips/级）。
+     * [DEEP-DOC]
+     */
+
+    function xyExpCollect() {
+        const items = [];
+        const qs = hwQuestionsData || [];
+        const pqs = hwPdfQuestions || [];
+        const rs = (hwSubmissionResult && hwSubmissionResult.questionResults) || [];
+        const rmap = new Map(rs.map(r => [String(r.id), r]));
+        qs.forEach((qd, i) => {
+            const pq = pqs && pqs[i] ? pqs[i] : null;
+            const ri = qd ? rmap.get(String(qd.id)) : null;
+            const it = {
+                index: (pq && pq.index) || (i + 1),
+                type: qd ? qd.type : 0,
+                typeLabel: (pq && pq.typeLabel) || hwTypeLabel(qd ? qd.type : 0),
+                titleSegs: (pq && pq.titleSegments) || (qd && qd.titleText ? [{ type: 'text', value: qd.titleText }] : []),
+                options: (pq && pq.options) || (qd && qd.options ? qd.options.map(o => ({ letter: o.letter, text: o.text, segments: o.text ? [{ type: 'text', value: o.text }] : [] })) : []),
+                blankCount: (pq && pq.blankCount) || (qd && qd.sItems ? qd.sItems.length : 0),
+                matchingL: (pq && pq.matchingLeftItems) || [],
+                matchingR: (pq && pq.matchingRightItems) || [],
+                isAttach: !!(qd && qd.type === 7),
+                mineSegs: null, mineText: '',
+                stdSegs: null, stdText: '',
+                scoreLine: ri ? String((ri.stateLabel || '') + '  ' + (ri.scoreText || '')).trim() : ''
+            };
+            if (ri && ri.rawUserAnswer != null && typeof ri.rawUserAnswer === 'string' &&
+                (ri.rawUserAnswer.includes('"blocks"') || ri.rawUserAnswer.includes('"dist"'))) {
+                const p = hwParseRichContent(ri.rawUserAnswer);
+                if (p.segments && p.segments.length) it.mineSegs = p.segments;
+            }
+            if (!it.mineSegs) {
+                let ua = ri ? ri.userAnswer : (qd ? hwFormatAnswer(qd, null) : '');
+                if (qd && qd.options && qd.options.length && /^\d{8,}$/.test(String(ua || '').trim())) {
+                    const o = qd.options.find(o => String(o.id) === String(ua).trim());
+                    if (o) ua = o.letter + '. ' + (o.text || '');
+                }
+                it.mineText = ua || '无记录';
+            }
+            if (ri && ri.standardAnswer && qd && qd.sItems) {
+                if (qd.type === 6 && qd.sItems[0] && qd.sItems[0].answer) {
+                    const p = hwParseRichContent(qd.sItems[0].answer);
+                    if (p.segments && p.segments.length) it.stdSegs = p.segments;
+                } else if (qd.type === 4) {
+                    const fp = [];
+                    qd.sItems.forEach((s, k) => {
+                        if (k > 0) fp.push({ type: 'text', value: ' | ' });
+                        const v = hwExtractRichDisplay(s.answer);
+                        fp.push({ type: 'text', value: '空' + (k + 1) + '：' + (v || '未填') });
+                    });
+                    it.stdSegs = fp;
+                }
+            }
+            if (!it.stdSegs) it.stdText = (ri && ri.standardAnswer) ? String(ri.standardAnswer).trim() : '';
+            items.push(it);
+        });
+        return items;
+    }
+
+    /** 段序列 → 图片来源列表（保序去重）。 */
+    function xyExpSegSrcs(segs) {
+        const out = [];
+        (segs || []).forEach(s => { if (s && s.type === 'image' && s.src && !out.includes(s.src)) out.push(s.src); });
+        return out;
+    }
+    /** 按内容范围收集全部图片来源（题目/选项/匹配/我的作答/标准答案）。 */
+    function xyExpCollectSrcs(items, scope) {
+        const srcs = [];
+        items.forEach(it => {
+            if (scope.q !== false) {
+                xyExpSegSrcs(it.titleSegs).forEach(s => srcs.push(s));
+                (it.options || []).forEach(o => xyExpSegSrcs(o.segments).forEach(s => srcs.push(s)));
+                (it.matchingL || []).forEach(o => xyExpSegSrcs(o.segments).forEach(s => srcs.push(s)));
+                (it.matchingR || []).forEach(o => xyExpSegSrcs(o.segments).forEach(s => srcs.push(s)));
+            }
+            if (scope.mine !== false && it.mineSegs) xyExpSegSrcs(it.mineSegs).forEach(s => srcs.push(s));
+            if (scope.std !== false && it.stdSegs) xyExpSegSrcs(it.stdSegs).forEach(s => srcs.push(s));
+        });
+        const uniq = [];
+        srcs.forEach(s => { if (!uniq.includes(s)) uniq.push(s); });
+        return uniq;
+    }
+
+    /** 笔记版文本流构建：按内容范围拼纯文本；withImages 时图片段写为
+     *  \uE000<idx> 标记（idx 与 imgList 一一对应），否则写［图片：见平台］占位。 */
+    function xyExpNotesText(items, scope, withImages) {
+        const imgList = [];
+        const imgIdx = new Map();
+        const markIdx = src => {
+            if (!imgIdx.has(src)) { imgIdx.set(src, imgList.length); imgList.push(src); }
+            return imgIdx.get(src);
+        };
+        const L = [];
+        const emitSegs = segs => {
+            (segs || []).forEach(s => {
+                if (!s) return;
+                if (s.type === 'image') {
+                    L.push(withImages && s.src ? '\uE000' + markIdx(s.src) : '［图片：见平台］');
+                } else if (s.type === 'formula') {
+                    L.push('[公式: ' + String(s.value || '').trim() + ']');
+                } else if (s.value != null) {
+                    String(s.value).split('\n').forEach(ln => { if (ln) L.push(ln); });
+                }
+            });
+        };
+        let n = 0;
+        items.forEach(it => {
+            n += 1;
+            L.push('第 ' + n + ' 题 ' + it.typeLabel);
+            if (scope.q !== false) {
+                emitSegs(it.titleSegs);
+                if (it.type === 4 && it.blankCount) L.push('（共 ' + it.blankCount + ' 个填空）');
+                if (it.type === 13) {
+                    L.push('左侧：');
+                    (it.matchingL || []).forEach(o => { L.push(o.letter + '. ' + (o.text || '')); emitSegs(o.segments); });
+                    L.push('右侧候选：');
+                    (it.matchingR || []).forEach(o => { L.push(o.letter + '. ' + (o.text || '')); emitSegs(o.segments); });
+                }
+                if ((it.options || []).length) {
+                    const hasImg = (it.options || []).some(o => (o.segments || []).some(s => s && s.type === 'image'));
+                    if (hasImg) it.options.forEach(o => { L.push(o.letter + '. ' + (o.text || '')); emitSegs(o.segments); });
+                    else L.push(it.options.map(o => o.letter + '. ' + (o.text || '')).join('   '));
+                }
+                if (it.isAttach) L.push('附件题，无作答内容。');
+            }
+            if (scope.mine !== false) {
+                if (it.isAttach) {
+                    L.push('我的答案：附件题无作答内容');
+                } else if (it.mineSegs) {
+                    L.push('我的答案：');
+                    emitSegs(it.mineSegs);
+                } else {
+                    L.push('我的答案：' + (it.mineText || '无记录'));
+                }
+                if (it.scoreLine) L.push('得分：' + it.scoreLine);
+            }
+            if (scope.std !== false) {
+                if (it.stdSegs) { L.push('标准答案：'); emitSegs(it.stdSegs); }
+                else L.push('标准答案：' + (it.stdText || '（平台未公布）'));
+            }
+            L.push('');
+        });
+        return { text: L.join('\n'), imgList };
+    }
+
+
+
+    /** 生成时间戳（与 §11 docx 导出命名风格一致）。 */
+    function xyHWStamp() {
+        const d = new Date(), p = v => String(v).padStart(2, '0');
+        return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' +
+               p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+    }
+
+    /** 触发浏览器下载（FileSaver 优先，降级到 a[download]）。 */
+    function xyHWSave(blob, filename) {
+        try {
+            if (typeof saveAs === 'function') { saveAs(blob, filename); return; }
+        } catch (e) { /* 降级 */ }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }
+
+    /** 笔记版图片块尺寸：按 150dpi 显示密度（5.9px/mm）换算为画布单位；
+     *  下载失败条目置 null（排版引擎按 1 行占位，不中断流程）。 */
+    function xyExpNotesImages(imgList, imMap) {
+        const MM = XYPaper.MM;
+        const contentWmm = 146.5;
+        return imgList.map(src => {
+            const rec = imMap.get(src);
+            if (!rec || !rec.ok) return null;
+            const wpx = rec.width || 300, hpx = rec.height || 180;
+            const wmm = Math.min(contentWmm, wpx / 5.9);
+            const hmm = wmm * hpx / Math.max(1, wpx);
+            return { src: src, w: wmm * MM, h: hmm * MM };
+        });
+    }
+
+    /** arrayBuffer → HTMLImageElement（objectURL 生命周期由调用方管理）。 */
+    function xyExpBlobToImg(ab) {
+        const blob = new Blob([ab]);
+        const url = URL.createObjectURL(blob);
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+            img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('图片解码失败')); };
+            img.src = url;
+        });
+    }
+    /** 图片元素（模块级缓存，避免预览/导出重复解码）。 */
+    function xyExpImgEl(src, imMap) {
+        const rec = imMap.get(src);
+        if (!rec || !rec.ok) return Promise.resolve(null);
+        if (!_xyExpImgCache.has(src)) {
+            _xyExpImgCache.set(src, xyExpBlobToImg(rec.arrayBuffer).catch(() => null));
+        }
+        return _xyExpImgCache.get(src);
+    }
+
+    function xyExpCanvasToJPEG(cv, quality) {
+        return new Promise((resolve, reject) => {
+            cv.toBlob(b => {
+                if (!b) { reject(new Error('toBlob failed')); return; }
+                b.arrayBuffer().then(ab => resolve({ data: new Uint8Array(ab), w: cv.width, h: cv.height }), reject);
+            }, 'image/jpeg', quality || 0.92);
+        });
+    }
+
     /* ================= 独立入口 UI =================
      * 设计语言对齐「小雅辅助工具」主控台：
      *   - CSS 变量双主题（默认深色，可切换浅色，localStorage 持久化）
@@ -1507,7 +2349,7 @@ var XYExport = (function (Hinote) {  'use strict';
             try { localStorage.setItem(this.KEY, t); } catch (e) {}
         }
     };
-    console.log('[小雅手写归档] 引擎加载完成 v1.0.2');
+    console.log('[小雅手写归档] 引擎加载完成 v1.0.3');
 
     // 调试句柄：控制台可用 XyHandwriting.* 手动调用引擎各模块
     try { globalThis.XyHandwriting = { XYPaper: XYPaper, XYHinote: XYHinote, XYExport: XYExport, XY_HW_DB: XY_HW_DB, xyHWRaster: xyHWRaster, xyHWRasterPrinted: xyHWRasterPrinted }; } catch (e) {}
@@ -1579,7 +2421,16 @@ var XYExport = (function (Hinote) {  'use strict';
     async function exportAs(fmt) {
         var ta = document.getElementById('xyh-input');
         var text = (ta && ta.value || '').trim();
-        if (!text) { xyhToast('请先粘贴文字内容', 'warning'); return; }
+        var autoImages = [];
+        var imMap = new Map();
+        if (!text && hwQuestionsData && hwQuestionsData.length) {
+            var _items = xyExpCollect();
+            var _nt = xyExpNotesText(_items, { q: true, std: true, mine: true }, true);
+            text = _nt.text;
+            imMap = _nt.imgList.length ? await hwHydrateImageMap(_nt.imgList, 1000, false) : new Map();
+            autoImages = xyExpNotesImages(_nt.imgList, imMap);
+        }
+        if (!text) { xyhToast('未捕获到作业题目，且未粘贴文字。请先打开作业页面点 🔄，或直接粘贴内容', 'warning'); return; }
         var btns = document.querySelectorAll('[data-xhn-fmt]');
         btns.forEach(function (b) { b.disabled = true; });
         var st = document.getElementById('xyh-status');
@@ -1588,7 +2439,7 @@ var XYExport = (function (Hinote) {  'use strict';
             var res = XYPaper.build(text, {
                 db: XY_HW_DB, ink: 0x1A1A1A,
                 raster: xyHWRaster, rasterPrinted: xyHWRasterPrinted,
-                images: []
+                images: autoImages
             });
             if (!res || !res.strokes || !res.strokes.length) { xyhToast('生成失败：未产出笔迹', 'error'); return; }
             var rawName = (document.getElementById('xhn-fname') && document.getElementById('xhn-fname').value) || '手写归档';
@@ -1597,15 +2448,28 @@ var XYExport = (function (Hinote) {  'use strict';
                 var buf = await XYHinote.writeHinote(res.strokes, { title: title });
                 xyhSaveBlob(new Blob([buf], { type: 'application/octet-stream' }), title + '.hinote');
                 xyhToast('✅ 已导出 ' + title + '.hinote（' + res.stats.pages + ' 页）', 'success');
-            } else if (fmt === 'pdf') {
-                await XYExport.downloadPDF(res, res.strokes, title, 150, 0.92, []);
-                xyhToast('✅ 已导出 PDF（' + res.stats.pages + ' 页）', 'success');
             } else {
-                await XYExport.downloadJPGs(res, res.strokes, title, 150, 0.92, []);
-                xyhToast('✅ 已导出图片（' + res.stats.pages + ' 页）', 'success');
+                var imgLayout = [];
+                if (autoImages.length && res.imgLayout) {
+                    for (var _pi = 0; _pi < res.imgLayout.length; _pi++) {
+                        var pl = res.imgLayout[_pi];
+                        var im = autoImages[pl.idx];
+                        if (!im) continue;
+                        var el = await xyExpImgEl(im.src, imMap);
+                        if (el) imgLayout.push({ page: pl.page, x: pl.x, y: pl.y, w: pl.w, h: pl.h, img: el });
+                    }
+                }
+                if (fmt === 'pdf') {
+                    await XYExport.downloadPDF(res, res.strokes, title, 150, 0.92, imgLayout);
+                    xyhToast('✅ 已导出 PDF（' + res.stats.pages + ' 页）', 'success');
+                } else {
+                    await XYExport.downloadJPGs(res, res.strokes, title, 150, 0.92, imgLayout);
+                    xyhToast('✅ 已导出图片（' + res.stats.pages + ' 页）', 'success');
+                }
             }
             if (st) { st.textContent = '✅ 上次导出：' + res.stats.chars + ' 字 / ' + res.stats.pages + ' 页'; st.style.opacity = '.85'; }
         } catch (e) {
+            console.error('[debug导出] 堆栈:', (e && e.stack || '').split(String.fromCharCode(10)).slice(1, 4).join(' | '));
             xyhToast('导出失败：' + ((e && e.message) || e), 'error');
             if (st) { st.textContent = '❌ 导出失败'; }
         } finally {
@@ -1708,6 +2572,8 @@ var XYExport = (function (Hinote) {  'use strict';
             '#xyh-panel .xyh-btn-jpg{border:1px solid var(--xyh-border-light); background:var(--xyh-surface2); color:var(--xyh-text2);}' +
             '#xyh-panel .xyh-btn-jpg:not(:disabled):hover{box-shadow:0 2px 10px rgba(0,0,0,.12);}' +
             '#xyh-panel .xyh-status{min-height:16px; font-size:10.5px; color:var(--xyh-muted); line-height:1.5;}' +
+            '#xyh-panel .xyh-databar{display:flex; align-items:center; gap:8px; padding:7px 13px; font-size:10.5px;' +
+                'color:var(--xyh-muted); background:var(--xyh-surface2); border-top:1px solid var(--xyh-border); border-bottom:1px solid var(--xyh-border);}' +
             '#xyh-panel .xyh-foot{font-size:9.5px; color:var(--xyh-muted); line-height:1.6; border-top:1px solid var(--xyh-border);' +
                 'padding:8px 13px 10px;}';
 
@@ -1741,6 +2607,13 @@ var XYExport = (function (Hinote) {  'use strict';
         shadowWrap.appendChild(head);
         shadowWrap.appendChild(body);
         shadowWrap.appendChild(foot);
+
+        var databar = document.createElement('div');
+        databar.className = 'xyh-databar';
+        databar.innerHTML =
+            '<span id="xyh-databar-text" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📡 正在检测作业数据…</span>' +
+            '<button type="button" id="xyh-refetch" class="xyh-icon-btn" aria-label="重新获取作业题目" title="重新获取作业题目" style="font-size:12px;">🔄</button>';
+        shadowWrap.insertBefore(databar, body);
         xyhApplyTheme(panel, fab, theme);
 
         document.body.appendChild(fab);
@@ -1783,6 +2656,25 @@ var XYExport = (function (Hinote) {  'use strict';
         panel.querySelectorAll('[data-xhn-fmt]').forEach(function (b) {
             b.addEventListener('click', function () { void exportAs(b.getAttribute('data-xhn-fmt')); });
         });
+        /* 作业数据：手动重拉 + 自动探测 */
+        panel.querySelector('#xyh-refetch').addEventListener('click', function () {
+            var el = document.getElementById('xyh-databar-text');
+            if (el) el.textContent = '📡 正在拉取作业题目…';
+            if (hwQuestionsData.length === 0 && !getPaperId() && !/[?&]paper_id=/.test(location.href)) {
+                if (el) el.textContent = '📡 未检测到作业参数 · 请先打开作业/试卷页面';
+                xyhToast('请先进入作业或试卷页面再获取', 'warning');
+                return;
+            }
+            hwQuestionsData = []; hwPdfQuestions = [];
+            void hwProactiveFetchData();
+        });
+        function xyhAutoScan() {
+            if (hwQuestionsData.length) { hwUpdateUI(); return; }
+            if (getPaperId() || /[?&]paper_id=/.test(location.href)) void hwProactiveFetchData();
+        }
+        setTimeout(xyhAutoScan, 800);
+        setInterval(xyhAutoScan, 8000);
+        hwUpdateUI();
         console.log('[小雅手写归档] UI 已挂载');
         } catch (e) { console.error('[小雅手写归档] UI 挂载失败：', e); }
     }
