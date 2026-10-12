@@ -5,6 +5,7 @@
 // @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
+// @icon         data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2048%2048%22%3E%3Crect%20x%3D%222%22%20y%3D%222%22%20width%3D%2244%22%20height%3D%2244%22%20rx%3D%2210%22%20fill%3D%22%231e293b%22%2F%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22g%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%221%22%20y2%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%23a855f7%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%2306b6d4%22%2F%3E%3C%2FlinearGradient%3E%3C%2Fdefs%3E%3Cpath%20d%3D%22M24%2012%20L29.2%2024.8%20L24%2022.4%20L18.8%2024.8%20Z%22%20fill%3D%22url(%23g)%22%2F%3E%3Cpath%20d%3D%22M24%2022.4%20L24%2032.4%22%20stroke%3D%22url(%23g)%22%20stroke-width%3D%223%22%20stroke-linecap%3D%22round%22%2F%3E%3Cpath%20d%3D%22M12.8%2036.8%20C16.4%2034.4%2019.6%2038.4%2023.2%2036.4%20C26.8%2034.4%2030%2038%2035.2%2036%22%20fill%3D%22none%22%20stroke%3D%22url(%23g)%22%20stroke-width%3D%222.8%22%20stroke-linecap%3D%22round%22%2F%3E%3C%2Fsvg%3E
 // @source       https://gitee.com/fieldlu/xy-handwriting-archive
 // @match        https://*.ai-augmented.com/*
 // @run-at       document-idle
