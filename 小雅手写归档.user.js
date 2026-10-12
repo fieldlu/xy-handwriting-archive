@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅手写归档
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.3
+// @version      1.0.4
 // @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -2419,18 +2419,16 @@ var XYExport = (function (Hinote) {  'use strict';
     }
 
     async function exportAs(fmt) {
-        var ta = document.getElementById('xyh-input');
-        var text = (ta && ta.value || '').trim();
         var autoImages = [];
         var imMap = new Map();
-        if (!text && hwQuestionsData && hwQuestionsData.length) {
+        if (hwQuestionsData && hwQuestionsData.length) {
             var _items = xyExpCollect();
             var _nt = xyExpNotesText(_items, { q: true, std: true, mine: true }, true);
-            text = _nt.text;
+            var text = _nt.text;
             imMap = _nt.imgList.length ? await hwHydrateImageMap(_nt.imgList, 1000, false) : new Map();
             autoImages = xyExpNotesImages(_nt.imgList, imMap);
         }
-        if (!text) { xyhToast('未捕获到作业题目，且未粘贴文字。请先打开作业页面点 🔄，或直接粘贴内容', 'warning'); return; }
+        if (!text) { xyhToast('还未捕获到作业题目，请先打开作业/试卷页面', 'warning'); return; }
         var btns = document.querySelectorAll('[data-xhn-fmt]');
         btns.forEach(function (b) { b.disabled = true; });
         var st = document.getElementById('xyh-status');
@@ -2588,8 +2586,7 @@ var XYExport = (function (Hinote) {  'use strict';
         var body = document.createElement('div');
         body.className = 'xyh-body';
         body.innerHTML =
-            '<textarea id="xyh-input" placeholder="把题目、错题、知识点、复习提纲粘贴到这里…&#10;一键变手写 · 自动分页" aria-label="文字内容"></textarea>' +
-            '<div class="xyh-meta"><span id="xyh-count">0 字</span><span>A4 笔记纸 · 自动分页 · 可导入华为笔记</span></div>' +
+            '<div class="xyh-meta" style="margin-bottom:0;"><span id="xyh-count">进入作业页面自动捕获题目</span><span>A4 笔记纸 · 自动分页</span></div>' +
             '<input id="xhn-fname" placeholder="文件名（默认：手写归档）" aria-label="文件名">' +
             '<div class="xyh-btns">' +
                 '<button class="xyh-btn xyh-btn-hinote" data-xhn-fmt="hinote" type="button">📒 .hinote</button>' +
@@ -2645,13 +2642,6 @@ var XYExport = (function (Hinote) {  'use strict';
                 }
             }, true);
         })();
-        /* 字数统计 */
-        var ta = panel.querySelector('#xyh-input');
-        var cnt = panel.querySelector('#xyh-count');
-        ta.addEventListener('input', function () {
-            var n = ta.value.replace(/\s/g, '').length;
-            cnt.textContent = n + ' 字' + (n > 0 ? ' · 约 ' + Math.max(1, Math.ceil(n / 320)) + ' 页' : '');
-        });
         /* 导出按钮 */
         panel.querySelectorAll('[data-xhn-fmt]').forEach(function (b) {
             b.addEventListener('click', function () { void exportAs(b.getAttribute('data-xhn-fmt')); });
