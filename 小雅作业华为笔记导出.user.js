@@ -7,6 +7,8 @@
 // @license      GPL-3.0-or-later
 // @icon         https://www.ai-augmented.com/static/logo3.1dbbea8f.png
 // @source       https://gitee.com/fieldlu/xy-handwriting-archive
+// @updateURL    https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js
+// @downloadURL  https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js
 // @match        https://*.ai-augmented.com/*
 // @run-at       document-start
 // @noframes
@@ -1473,8 +1475,13 @@ var XYExport = (function (Hinote) {  'use strict';
     var xyhDbReady = null;
     /** 笔顺库懒加载（外置分发：脚本本体不含 2.3MB 字库，过 ScriptCat 2MB 上限）。
      * GM 特权拉取 + 自动重试 2 次；UI 挂载后预取，首次导出零等待。 */
+    function xyhDbCacheKey() { return 'xyh_db_' + (typeof GM_info !== 'undefined' && GM_info.script ? GM_info.script.version : '0'); }
     function xyhLoadDb() {
         if (xyhDbReady) return xyhDbReady;
+        try {
+            var cached = (typeof GM_getValue === 'function') ? GM_getValue(xyhDbCacheKey(), '') : '';
+            if (cached) { XY_HW_DB = JSON.parse(cached); xyhDbReady = Promise.resolve(XY_HW_DB); return xyhDbReady; }
+        } catch (e) { /* 缓存读取失败走网络 */ }
         xyhDbReady = new Promise(function (resolve, reject) {
             var attempt = 0;
             var run = function () {
@@ -1487,7 +1494,7 @@ var XYExport = (function (Hinote) {  'use strict';
                     method: 'GET', url: XY_HW_DB_URL, timeout: 60000,
                     onload: function (r) {
                         if (r.status !== 200 || !r.responseText) return fail('笔顺库加载 HTTP ' + r.status);
-                        try { XY_HW_DB = JSON.parse(r.responseText); resolve(XY_HW_DB); }
+                        try { XY_HW_DB = JSON.parse(r.responseText); try { if (typeof GM_setValue === 'function') GM_setValue(xyhDbCacheKey(), r.responseText); } catch (e) {} resolve(XY_HW_DB); }
                         catch (e) { fail('笔顺库解析失败: ' + (e.message || e)); }
                     },
                     onerror: function () { fail('笔顺库网络错误'); },
@@ -1497,6 +1504,32 @@ var XYExport = (function (Hinote) {  'use strict';
             run();
         });
         return xyhDbReady;
+    }
+
+    /* 应用内更新提醒：拉取 hw-script.latest.json 比对版本，6 小时频控。
+     * 脚本管理器另有 @updateURL 自动更新，此提示兜底让用户感知更新内容。 */
+    function xyhCheckUpdate() {
+        try {
+            var KEY = 'xyh_upd_at';
+            var now = Date.now();
+            var last = 0;
+            try { last = Number((typeof GM_getValue === 'function') ? GM_getValue(KEY, 0) : localStorage.getItem(KEY)) || 0; } catch (e) {}
+            if (now - last < 6 * 3600 * 1000) return;
+            try { if (typeof GM_setValue === 'function') GM_setValue(KEY, String(now)); localStorage.setItem(KEY, String(now)); } catch (e) {}
+            var myVer = (typeof GM_info !== 'undefined' && GM_info.script) ? GM_info.script.version : '';
+            GM_xmlhttpRequest({
+                method: 'GET', url: 'https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/hw-script.latest.json', timeout: 20000,
+                onload: function (r) {
+                    if (r.status !== 200 || !r.responseText) return;
+                    try {
+                        var j = JSON.parse(r.responseText);
+                        if (j.version && j.version !== myVer) {
+                            xyhToast('🆕 发现新版本 v' + j.version + '（当前 v' + myVer + '）' + (j.notes && j.notes[0] ? '：' + j.notes[0] : '') + '，请从安装渠道更新', 'info');
+                        }
+                    } catch (e) {}
+                }
+            });
+        } catch (e) {}
     }
     /* ================================================================
      * §14 手写纸引擎（XYHinote / XYLayout / XYPaper / XYExport + XY_HW_DB）
@@ -2810,6 +2843,8 @@ var XYExport = (function (Hinote) {  'use strict';
         });
         /* 笔顺库预取：后台静默加载，首次导出零等待 */
         setTimeout(function () { xyhLoadDb().catch(function () {}); }, 1200);
+        /* 更新提醒检查（6h 频控） */
+        setTimeout(function () { try { xyhCheckUpdate(); } catch (e) {} }, 5000);
         setTimeout(xyhAutoScan, 800);
         setInterval(xyhAutoScan, 8000);
         hwUpdateUI();
