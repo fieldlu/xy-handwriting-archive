@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅手写归档
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.1.0
+// @version      1.0.1
 // @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
