@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         小雅手写归档
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.5
+// @version      1.0.6
 // @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
 // @icon         https://www.ai-augmented.com/static/logo3.1dbbea8f.png
 // @source       https://gitee.com/fieldlu/xy-handwriting-archive
 // @match        https://*.ai-augmented.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -25,6 +25,76 @@
 
 (function () {
     'use strict';
+
+    /* ================================================================
+     * 实时请求劫持（v1.0.6，自小雅辅助工具 §11 迁移）：先于页面脚本安装，
+     * 实时截获平台自发发出的 queryStuPaper/v2 试卷请求（fetch + XHR 双通道），
+     * 响应解析入库 hwQuestionsData —— 页面打开即捕获，无需等待主动拉取。
+     * hwCaptureParams / hwProcessPaperData 为后文函数声明（提升可用）。
+     * ================================================================ */
+    var _hw_nativeFetch = window.fetch.bind(window);
+    (function () {
+        const _prevFetch = window.fetch;
+        window.fetch = async function (input, init) {
+            const rawUrl = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
+            if (rawUrl && rawUrl.includes('/queryStuPaper/v2')) {
+                // 同时兼容旧 quiz/ 前缀与新 survey/course/ 前缀的试卷接口
+                const response = await _hw_nativeFetch.apply(this, arguments);
+                if (response.ok) {
+                    console.log('[小雅手写归档] 已捕获 fetch 题目数据包(200)');
+                    hwCaptureParams(rawUrl);
+                }
+                try {
+                    const cloned = response.clone();
+                    let data;
+                    try { data = await cloned.json(); } catch (e) { data = JSON.parse(await cloned.text()); }
+                    if (data && data.data && data.data.questions) hwProcessPaperData(data);
+                } catch (e) { console.error('[小雅手写归档] fetch 数据解包失败', e); }
+                return response;
+            }
+            return _prevFetch.apply(this, arguments);
+        };
+    })();
+    if (typeof XMLHttpRequest !== 'undefined') {
+    var _hw_nativeXhrOpen = XMLHttpRequest.prototype.open;
+    var _hw_nativeXhrSend = XMLHttpRequest.prototype.send;
+        (function () {
+            const _prevXhrOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function (method, url) {
+                this._hw_url = typeof url === 'string' ? url : String(url);
+                return _prevXhrOpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments, 2)));
+            };
+            const _prevXhrSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function () {
+                const self = this;
+                if (self._hw_url && self._hw_url.includes('/queryStuPaper/v2')) {
+                    self.addEventListener('load', function () {
+                        if (self.status === 200) {
+                            console.log('[小雅手写归档] 已捕获 XHR 题目数据包(200)');
+                            hwCaptureParams(self._hw_url);
+                        }
+                    });
+                    self.addEventListener('load', function () {
+                        try {
+                            let data;
+                            if (self.responseType === 'blob' && self.response) {
+                                self.response.text().then(function (text) {
+                                    const parsed = JSON.parse(text);
+                                    if (parsed && parsed.data && parsed.data.questions) hwProcessPaperData(parsed);
+                                }).catch(function (e) { console.error('[小雅手写归档] blob→text 解包失败', e); });
+                                return;
+                            }
+                            if (self.responseType === 'json' && self.response) data = self.response;
+                            else if ((self.responseType === '' || self.responseType === 'text') && self.responseText) data = JSON.parse(self.responseText);
+                            if (data && data.data && data.data.questions) hwProcessPaperData(data);
+                        } catch (e) { console.error('[小雅手写归档] XHR 解包失败', e); }
+                    });
+                    return _hw_nativeXhrSend.apply(this, arguments);
+                }
+                return _prevXhrSend.apply(this, arguments);
+            };
+        })();
+    }
 
 /* hinote.js — 华为 .hinote 生成器（零依赖，浏览器 / Node 双端）
    移植自 tools/hinote_writer.py，二进制布局逐字段对齐。
@@ -1494,7 +1564,11 @@ var XYExport = (function (Hinote) {  'use strict';
     let hwPdfQuestions = [];
     let hwSubmissionResult = { state: 'waiting', message: '等待题目数据加载...' };
     let hwGroupId = '', hwNodeId = '', hwPaperId = '';
-    let hwActiveTaskKey = '', hwRecordId = '', hwResultFilter = 'all', hwResultOpen = false, hwActiveTab = 'answer';
+    let hwActiveTaskKey = '';
+    let hwRecordId = '';            
+    let hwResultFilter = 'all';     
+    let hwResultOpen = false;       
+    let hwActiveTab = 'answer';     
 
     function hwUpdateUI() {
         var el = document.getElementById('xyh-databar-text');
@@ -1549,7 +1623,6 @@ var XYExport = (function (Hinote) {  'use strict';
         } catch(e) { console.warn('[小雅辅助] 无法解析作业请求参数', e); }
     }
 
-    const _hw_nativeFetch = window.fetch.bind(window);
     async function xyFetch(url, options = {}, timeoutMs = 15000) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1573,7 +1646,7 @@ var XYExport = (function (Hinote) {  'use strict';
                 var _d = await (res.clone ? res.clone() : res).json();
                 hwProcessPaperData(_d);
             }
-        } catch (e) { console.error('[debug包装] 解析异常:', e && e.message); }
+        } catch (e) { /* 解析失败不影响原响应返回 */ }
         return res;
     };
     var _xyhOrigNative = xyNativeFetch;
@@ -1604,6 +1677,9 @@ var XYExport = (function (Hinote) {  'use strict';
         }
         return '';
     }
+    /** 记录 ID 获取编排：hwRecordId 缓存非空直返；否则 RefreshPaperData 触发
+     * 劫持链重新捕获试卷载荷补齐，仍拿不到抛错（上层提示初始化失败）。
+     * [DEEP-DOC]
     function hwSafeText(v) { return String(v??'').slice(0,32767); }
     /** 作业域安全转数：Number() 结果有限才返回，否则 null（区别于概览域的 fallback-0 语义——这里 null 参与判空分支）。
      * [DEEP-DOC]
@@ -2349,22 +2425,7 @@ var XYExport = (function (Hinote) {  'use strict';
             try { localStorage.setItem(this.KEY, t); } catch (e) {}
         }
     };
-
-    var XyhScope = {
-        KEY: 'xyh_scope',
-        get: function () {
-            try {
-                var raw = (typeof GM_getValue === 'function') ? GM_getValue(this.KEY, '') : localStorage.getItem(this.KEY);
-                var o = raw ? JSON.parse(raw) : {};
-                return { q: o.q !== false, std: o.std !== false, mine: o.mine !== false };
-            } catch (e) { return { q: true, std: true, mine: true }; }
-        },
-        set: function (scope) {
-            try { if (typeof GM_setValue === 'function') GM_setValue(this.KEY, JSON.stringify(scope)); } catch (e) {}
-            try { localStorage.setItem(this.KEY, JSON.stringify(scope)); } catch (e) {}
-        }
-    };
-    console.log('[小雅手写归档] 引擎加载完成 v1.0.3');
+    console.log('[小雅手写归档] 引擎加载完成 v1.0.6');
 
     // 调试句柄：控制台可用 XyHandwriting.* 手动调用引擎各模块
     try { globalThis.XyHandwriting = { XYPaper: XYPaper, XYHinote: XYHinote, XYExport: XYExport, XY_HW_DB: XY_HW_DB, xyHWRaster: xyHWRaster, xyHWRasterPrinted: xyHWRasterPrinted }; } catch (e) {}
@@ -2433,25 +2494,19 @@ var XYExport = (function (Hinote) {  'use strict';
         if (tg) tg.textContent = theme === 'light' ? '🌙' : '☀️';
     }
 
-    function xyhScopeGet() { var sc = XyhScope.get();
-        ['q', 'std', 'mine'].forEach(function (k) {
-            var el = document.getElementById('xyh-scope-' + k);
-            if (el) sc[k] = el.checked;
-        });
-        return sc;
-    }
-
     async function exportAs(fmt) {
+        var ta = document.getElementById('xyh-input');
+        var text = (ta && ta.value || '').trim();
         var autoImages = [];
         var imMap = new Map();
-        if (hwQuestionsData && hwQuestionsData.length) {
+        if (!text && hwQuestionsData && hwQuestionsData.length) {
             var _items = xyExpCollect();
-            var _nt = xyExpNotesText(_items, xyhScopeGet(), true);
-            var text = _nt.text;
+            var _nt = xyExpNotesText(_items, { q: true, std: true, mine: true }, true);
+            text = _nt.text;
             imMap = _nt.imgList.length ? await hwHydrateImageMap(_nt.imgList, 1000, false) : new Map();
             autoImages = xyExpNotesImages(_nt.imgList, imMap);
         }
-        if (!text) { xyhToast('还未捕获到作业题目，请先打开作业/试卷页面', 'warning'); return; }
+        if (!text) { xyhToast('未捕获到作业题目，且未粘贴文字。请先打开作业页面点 🔄，或直接粘贴内容', 'warning'); return; }
         var btns = document.querySelectorAll('[data-xhn-fmt]');
         btns.forEach(function (b) { b.disabled = true; });
         var st = document.getElementById('xyh-status');
@@ -2490,7 +2545,6 @@ var XYExport = (function (Hinote) {  'use strict';
             }
             if (st) { st.textContent = '✅ 上次导出：' + res.stats.chars + ' 字 / ' + res.stats.pages + ' 页'; st.style.opacity = '.85'; }
         } catch (e) {
-            console.error('[debug导出] 堆栈:', (e && e.stack || '').split(String.fromCharCode(10)).slice(1, 4).join(' | '));
             xyhToast('导出失败：' + ((e && e.message) || e), 'error');
             if (st) { st.textContent = '❌ 导出失败'; }
         } finally {
@@ -2575,6 +2629,9 @@ var XYExport = (function (Hinote) {  'use strict';
                 'padding:3px 6px; border-radius:7px; line-height:1;}' +
             '#xyh-panel .xyh-icon-btn:hover{background:var(--xyh-surface2); color:var(--xyh-text);}' +
             '#xyh-panel .xyh-body{padding:12px 13px; display:flex; flex-direction:column; gap:9px;}' +
+            '#xyh-panel textarea{width:100%; min-height:150px; resize:vertical; padding:9px 11px; font-size:12.5px; line-height:1.65;' +
+                'border-radius:9px; border:1px solid var(--xyh-border); background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
+            '#xyh-panel textarea:focus{border-color:#a855f7; box-shadow:0 0 0 3px rgba(168,85,247,.14);}' +
             '#xyh-panel input{width:100%; padding:7px 10px; font-size:11.5px; border-radius:8px; border:1px solid var(--xyh-border);' +
                 'background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
             '#xyh-panel .xyh-meta{display:flex; justify-content:space-between; font-size:10px; color:var(--xyh-muted);}' +
@@ -2606,12 +2663,8 @@ var XYExport = (function (Hinote) {  'use strict';
         var body = document.createElement('div');
         body.className = 'xyh-body';
         body.innerHTML =
-            '<div class="xyh-meta" style="margin-bottom:0;"><span id="xyh-count">进入作业页面自动捕获题目</span><span>A4 笔记纸 · 自动分页</span></div>' +
-            '<div class="xyh-scope" style="display:flex; gap:11px; font-size:11px; color:var(--xyh-text2);">' +
-                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-q" style="accent-color:#06b6d4; cursor:pointer;" checked/>题目</label>' +
-                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-std" style="accent-color:#06b6d4; cursor:pointer;" checked/>标准答案</label>' +
-                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-mine" style="accent-color:#06b6d4; cursor:pointer;" checked/>我的作答</label>' +
-            '</div>' +
+            '<textarea id="xyh-input" placeholder="把题目、错题、知识点、复习提纲粘贴到这里…&#10;一键变手写 · 自动分页" aria-label="文字内容"></textarea>' +
+            '<div class="xyh-meta"><span id="xyh-count">0 字</span><span>A4 笔记纸 · 自动分页 · 可导入华为笔记</span></div>' +
             '<input id="xhn-fname" placeholder="文件名（默认：手写归档）" aria-label="文件名">' +
             '<div class="xyh-btns">' +
                 '<button class="xyh-btn xyh-btn-hinote" data-xhn-fmt="hinote" type="button">📒 .hinote</button>' +
@@ -2667,6 +2720,13 @@ var XYExport = (function (Hinote) {  'use strict';
                 }
             }, true);
         })();
+        /* 字数统计 */
+        var ta = panel.querySelector('#xyh-input');
+        var cnt = panel.querySelector('#xyh-count');
+        ta.addEventListener('input', function () {
+            var n = ta.value.replace(/\s/g, '').length;
+            cnt.textContent = n + ' 字' + (n > 0 ? ' · 约 ' + Math.max(1, Math.ceil(n / 320)) + ' 页' : '');
+        });
         /* 导出按钮 */
         panel.querySelectorAll('[data-xhn-fmt]').forEach(function (b) {
             b.addEventListener('click', function () { void exportAs(b.getAttribute('data-xhn-fmt')); });
@@ -2687,19 +2747,6 @@ var XYExport = (function (Hinote) {  'use strict';
             if (hwQuestionsData.length) { hwUpdateUI(); return; }
             if (getPaperId() || /[?&]paper_id=/.test(location.href)) void hwProactiveFetchData();
         }
-        /* 内容范围：恢复勾选 + 变更持久化 */
-        var sc = XyhScope.get();
-        ['q', 'std', 'mine'].forEach(function (k) {
-            var el = panel.querySelector('#xyh-scope-' + k);
-            if (el) {
-                el.checked = sc[k];
-                el.addEventListener('change', function () {
-                    var cur = { q: panel.querySelector('#xyh-scope-q').checked, std: panel.querySelector('#xyh-scope-std').checked, mine: panel.querySelector('#xyh-scope-mine').checked };
-                    XyhScope.set(cur);
-                    if (!cur.q && !cur.std && !cur.mine) { el.checked = true; XyhScope.set({ q: true, std: true, mine: true }); xyhToast('至少保留一项内容', 'warning'); }
-                });
-            }
-        });
         setTimeout(xyhAutoScan, 800);
         setInterval(xyhAutoScan, 8000);
         hwUpdateUI();
