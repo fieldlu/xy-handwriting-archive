@@ -2552,9 +2552,6 @@ var XYExport = (function (Hinote) {  'use strict';
                 'padding:3px 6px; border-radius:7px; line-height:1;}' +
             '#xyh-panel .xyh-icon-btn:hover{background:var(--xyh-surface2); color:var(--xyh-text);}' +
             '#xyh-panel .xyh-body{padding:12px 13px; display:flex; flex-direction:column; gap:9px;}' +
-            '#xyh-panel textarea{width:100%; min-height:150px; resize:vertical; padding:9px 11px; font-size:12.5px; line-height:1.65;' +
-                'border-radius:9px; border:1px solid var(--xyh-border); background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
-            '#xyh-panel textarea:focus{border-color:#a855f7; box-shadow:0 0 0 3px rgba(168,85,247,.14);}' +
             '#xyh-panel input{width:100%; padding:7px 10px; font-size:11.5px; border-radius:8px; border:1px solid var(--xyh-border);' +
                 'background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
             '#xyh-panel .xyh-meta{display:flex; justify-content:space-between; font-size:10px; color:var(--xyh-muted);}' +
