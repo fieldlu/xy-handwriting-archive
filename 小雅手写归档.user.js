@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅手写归档
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.1
+// @version      1.1.0
 // @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -1484,103 +1484,297 @@ var XYExport = (function (Hinote) {  'use strict';
     }
 
 
-    /* ================= 独立入口 UI ================= */
+    /* ================= 独立入口 UI =================
+     * 设计语言对齐「小雅辅助工具」主控台：
+     *   - CSS 变量双主题（默认深色，可切换浅色，localStorage 持久化）
+     *   - xy-panel / xy-action-btn / xy-mini-btn 组件家族 + xy-* 配色变量
+     *   - FAB 可拖拽（pointer events，位置持久化）、面板标题栏拖拽
+     *   - SVG 渐变 logo、aria 可访问性、prefers-reduced-motion 适配
+     * 借鉴 GitHub 同类项目最佳实践（Summarizerrrr 拖拽记忆 / CKUI 主题系统 /
+     * userscript UI 隔离规范）：样式作用域 #xyh-* 前缀，z-index 顶层。
+     */
+
+    var XyhTheme = {
+        KEY: 'xyh_theme',
+        get: function () {
+            try { var t = localStorage.getItem(this.KEY); return (t === 'light' || t === 'dark') ? t : 'dark'; }
+            catch (e) { return 'dark'; }
+        },
+        set: function (t) { try { localStorage.setItem(this.KEY, t); } catch (e) {} }
+    };
 
     // 调试句柄：控制台可用 XyHandwriting.* 手动调用引擎各模块
     try { globalThis.XyHandwriting = { XYPaper: XYPaper, XYHinote: XYHinote, XYExport: XYExport, XY_HW_DB: XY_HW_DB, xyHWRaster: xyHWRaster, xyHWRasterPrinted: xyHWRasterPrinted }; } catch (e) {}
 
-    function toast(msg) {
-        const t = document.createElement('div');
+    function xyhToast(msg, type) {
+        var colors = { success: '#10b981', error: '#ef4444', warning: '#f59e0b', info: '#4f46e5' };
+        var t = document.createElement('div');
+        t.setAttribute('role', 'status');
+        t.style.cssText = 'position:fixed; left:50%; transform:translateX(-50%); bottom:96px; z-index:2147483647;' +
+            'background:rgba(15,23,42,.94); color:#fff; font-size:12.5px; padding:10px 16px; border-radius:10px; max-width:72vw;' +
+            'border-left:3px solid ' + (colors[type] || colors.info) + '; box-shadow:0 8px 28px rgba(0,0,0,.28);' +
+            (document.getElementById('xyh-fab') && document.getElementById('xyh-fab').getAttribute('data-theme') === 'light'
+                ? 'background:#ffffff; color:#0f172a; border:1px solid #e2e8f0;' : '');
         t.textContent = msg;
-        t.style.cssText = 'position:fixed; left:50%; transform:translateX(-50%); bottom:88px; z-index:2147483647;' +
-            'background:rgba(15,23,42,.92); color:#fff; font-size:13px; padding:9px 16px; border-radius:9px; max-width:70vw;';
         document.body.appendChild(t);
-        setTimeout(() => t.remove(), 3200);
+        setTimeout(function () { t.remove(); }, 3200);
     }
-    function saveBlob(blob, filename) {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
+    var toast = xyhToast;
+
+    function xyhSaveBlob(blob, filename) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
         a.href = url; a.download = filename;
         document.body.appendChild(a); a.click(); a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
     }
-    function stamp() {
-        const d = new Date(), p = v => String(v).padStart(2, '0');
+    var saveBlob = xyhSaveBlob;
+
+    function xyhStamp() {
+        var d = new Date(), p = function (v) { return String(v).padStart(2, '0'); };
         return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' +
                p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
     }
+    var stamp = xyhStamp;
+
+    /** SVG 渐变 logo：钢笔笔尖 + 笔迹波线（紫→青渐变，与主工具 accent 家族同源） */
+    var XYH_LOGO_SVG = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">' +
+        '<defs><linearGradient id="xyh-lg" x1="0" y1="0" x2="1" y2="1">' +
+        '<stop offset="0" stop-color="#a855f7"/><stop offset="1" stop-color="#06b6d4"/></linearGradient></defs>' +
+        '<rect x="2.5" y="2.5" width="19" height="19" rx="5" fill="none" stroke="url(#xyh-lg)" stroke-width="1.6"/>' +
+        '<path d="M12 6.2 L14.6 12.4 L12 11.2 L9.4 12.4 Z" fill="url(#xyh-lg)"/>' +
+        '<path d="M12 11.2 L12 16.2" stroke="url(#xyh-lg)" stroke-width="1.5" stroke-linecap="round"/>' +
+        '<path d="M6.4 18.4 C8.2 17.2 9.8 19.2 11.6 18.2 C13.4 17.2 15 19 17.6 18" fill="none" stroke="url(#xyh-lg)" stroke-width="1.4" stroke-linecap="round"/></svg>';
+
+    /** 主题变量表：与主控台 --xy-* 配色同源 */
+    function xyhThemeVars(t) {
+        return t === 'light'
+            ? { surface: '#ffffff', surface2: '#f8fafc', border: '#e2e8f0', borderLight: '#cbd5e1',
+                text: '#0f172a', text2: '#475569', muted: '#94a3b8', inputBg: '#ffffff', maskBg: 'rgba(15,23,42,0.35)' }
+            : { surface: 'rgba(15,23,42,0.92)', surface2: 'rgba(30,41,59,0.65)', border: 'rgba(71,85,105,0.45)', borderLight: 'rgba(71,85,105,0.6)',
+                text: '#e2e8f0', text2: '#cbd5e1', muted: '#94a3b8', inputBg: 'rgba(15,23,42,0.5)', maskBg: 'rgba(0,0,0,0.4)' };
+    }
+    function xyhApplyTheme(root, fab, theme) {
+        var v = xyhThemeVars(theme);
+        var s = root.style;
+        s.setProperty('--xyh-surface', v.surface);
+        s.setProperty('--xyh-surface2', v.surface2);
+        s.setProperty('--xyh-border', v.border);
+        s.setProperty('--xyh-border-light', v.borderLight);
+        s.setProperty('--xyh-text', v.text);
+        s.setProperty('--xyh-text2', v.text2);
+        s.setProperty('--xyh-muted', v.muted);
+        s.setProperty('--xyh-input-bg', v.inputBg);
+        fab.setAttribute('data-theme', theme);
+        var tg = root.querySelector('#xyh-theme-toggle');
+        if (tg) tg.textContent = theme === 'light' ? '🌙' : '☀️';
+    }
 
     async function exportAs(fmt) {
-        const ta = document.getElementById('xhn-input');
-        const text = (ta && ta.value || '').trim();
-        if (!text) { toast('请先粘贴文字内容'); return; }
-        const btns = document.querySelectorAll('[data-xhn-fmt]');
-        btns.forEach(b => { b.disabled = true; });
+        var ta = document.getElementById('xyh-input');
+        var text = (ta && ta.value || '').trim();
+        if (!text) { xyhToast('请先粘贴文字内容', 'warning'); return; }
+        var btns = document.querySelectorAll('[data-xhn-fmt]');
+        btns.forEach(function (b) { b.disabled = true; });
+        var st = document.getElementById('xyh-status');
+        if (st) { st.textContent = '⏳ 正在生成' + (fmt === 'hinote' ? ' .hinote' : fmt === 'pdf' ? ' PDF' : ' 图片') + '…'; st.style.opacity = '1'; }
         try {
-            const res = XYPaper.build(text, {
+            var res = XYPaper.build(text, {
                 db: XY_HW_DB, ink: 0x1A1A1A,
                 raster: xyHWRaster, rasterPrinted: xyHWRasterPrinted,
                 images: []
             });
-            if (!res || !res.strokes || !res.strokes.length) { toast('生成失败：未产出笔迹'); return; }
-            const rawName = (document.getElementById('xhn-fname') && document.getElementById('xhn-fname').value) || '手写归档';
-            const title = rawName.replace(/[\\/:*?"<>|]/g, '_') + '_' + stamp();
+            if (!res || !res.strokes || !res.strokes.length) { xyhToast('生成失败：未产出笔迹', 'error'); return; }
+            var rawName = (document.getElementById('xhn-fname') && document.getElementById('xhn-fname').value) || '手写归档';
+            var title = rawName.replace(/[\\/:*?"<>|]/g, '_') + '_' + xyhStamp();
             if (fmt === 'hinote') {
-                const buf = await XYHinote.writeHinote(res.strokes, { title: title });
-                saveBlob(new Blob([buf], { type: 'application/octet-stream' }), title + '.hinote');
-                toast('✅ 已导出 ' + title + '.hinote（' + res.stats.pages + ' 页）');
+                var buf = await XYHinote.writeHinote(res.strokes, { title: title });
+                xyhSaveBlob(new Blob([buf], { type: 'application/octet-stream' }), title + '.hinote');
+                xyhToast('✅ 已导出 ' + title + '.hinote（' + res.stats.pages + ' 页）', 'success');
             } else if (fmt === 'pdf') {
                 await XYExport.downloadPDF(res, res.strokes, title, 150, 0.92, []);
-                toast('✅ 已导出 PDF（' + res.stats.pages + ' 页）');
+                xyhToast('✅ 已导出 PDF（' + res.stats.pages + ' 页）', 'success');
             } else {
                 await XYExport.downloadJPGs(res, res.strokes, title, 150, 0.92, []);
-                toast('✅ 已导出图片（' + res.stats.pages + ' 页）');
+                xyhToast('✅ 已导出图片（' + res.stats.pages + ' 页）', 'success');
             }
+            if (st) { st.textContent = '✅ 上次导出：' + res.stats.chars + ' 字 / ' + res.stats.pages + ' 页'; st.style.opacity = '.85'; }
         } catch (e) {
-            toast('导出失败：' + ((e && e.message) || e));
+            xyhToast('导出失败：' + ((e && e.message) || e), 'error');
+            if (st) { st.textContent = '❌ 导出失败'; }
         } finally {
-            btns.forEach(b => { b.disabled = false; });
+            btns.forEach(function (b) { b.disabled = false; });
         }
     }
 
-    function buildUI() {
-        if (document.getElementById('xhn-toggle')) return;
-        const bd = 'rgba(71,85,105,0.35)', bg = '#ffffff', tx = '#334155';
-        const btn = document.createElement('button');
-        btn.id = 'xhn-toggle';
-        btn.type = 'button';
-        btn.textContent = '✍️ 手写';
-        btn.style.cssText = 'position:fixed; right:18px; bottom:18px; z-index:2147483647; padding:9px 14px;' +
-            'border-radius:999px; border:1px solid rgba(6,182,212,.5); background:#06b6d4; color:#fff;' +
-            'font-size:12.5px; cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,.18);';
-        btn.addEventListener('click', () => {
-            const p = document.getElementById('xhn-panel');
-            p.style.display = p.style.display === 'none' ? 'block' : 'none';
+    function xyhMakeDraggable(handle, target, posKey) {
+        handle.style.cursor = 'move';
+        handle.addEventListener('pointerdown', function (ev) {
+            if (ev.target.closest('#xyh-theme-toggle,#xyh-minimize')) return;
+            ev.preventDefault();
+            var startX = ev.clientX, startY = ev.clientY;
+            var rect = target.getBoundingClientRect();
+            var ox = rect.left, oy = rect.top;
+            function move(e) {
+                var nx = Math.min(Math.max(0, ox + e.clientX - startX), window.innerWidth - rect.width);
+                var ny = Math.min(Math.max(0, oy + e.clientY - startY), window.innerHeight - 48);
+                target.style.left = nx + 'px'; target.style.top = ny + 'px';
+                target.style.right = 'auto'; target.style.bottom = 'auto';
+            }
+            function up() {
+                document.removeEventListener('pointermove', move);
+                document.removeEventListener('pointerup', up);
+                try { localStorage.setItem(posKey, JSON.stringify({ l: target.style.left, t: target.style.top })); } catch (e) {}
+            }
+            document.addEventListener('pointermove', move);
+            document.addEventListener('pointerup', up);
         });
-        const panel = document.createElement('div');
-        panel.id = 'xhn-panel';
-        panel.style.cssText = 'display:none; position:fixed; right:18px; bottom:62px; z-index:2147483647; width:340px;' +
-            'border:1px solid ${bd}; border-radius:12px; background:${bg}; padding:12px;' +
-            'box-shadow:0 8px 28px rgba(0,0,0,.22); font-family:inherit;';
-        panel.innerHTML =
-            '<div style="font-size:12.5px; font-weight:700; color:${tx}; margin-bottom:7px;">✍️ 手写归档（文字转手写）</div>' +
-            '<textarea id="xhn-input" placeholder="粘贴要转手写的文字内容…" style="width:100%; box-sizing:border-box; min-height:150px; resize:vertical;' +
-                'padding:8px 10px; font-size:12px; line-height:1.6; border-radius:8px; border:1px solid ${bd}; color:${tx}; outline:none;"></textarea>' +
-            '<input id="xhn-fname" placeholder="文件名（默认：手写归档）" style="width:100%; box-sizing:border-box; margin-top:8px; padding:6px 9px;' +
-                'font-size:11.5px; border-radius:7px; border:1px solid ${bd}; color:${tx}; outline:none;">' +
-            '<div style="display:flex; gap:7px; margin-top:9px;">' +
-                '<button data-xhn-fmt="hinote" type="button" style="flex:1.2; padding:8px 4px; font-size:11.5px; border-radius:8px;' +
-                    'border:1px solid rgba(168,85,247,.4); background:#faf5ff; color:#7e22ce; cursor:pointer;">📒 .hinote</button>' +
-                '<button data-xhn-fmt="pdf" type="button" style="flex:1; padding:8px 4px; font-size:11.5px; border-radius:8px;' +
-                    'border:1px solid rgba(6,182,212,.4); background:#e0f2fe; color:#0e7490; cursor:pointer;">📄 PDF</button>' +
-                '<button data-xhn-fmt="jpg" type="button" style="flex:1; padding:8px 4px; font-size:11.5px; border-radius:8px;' +
-                    'border:1px solid rgba(71,85,105,.35); background:#f1f5f9; color:#475569; cursor:pointer;">🖼 图片</button>' +
+    }
+
+    function xyhRestoreFabPos(fab) {
+        try {
+            var p = JSON.parse(localStorage.getItem('xyh_fab_pos') || 'null');
+            if (p && p.l && p.t) { fab.style.left = p.l; fab.style.top = p.t; fab.style.right = 'auto'; fab.style.bottom = 'auto'; }
+        } catch (e) {}
+    }
+
+    function buildUI() {
+        if (document.getElementById('xyh-fab')) return;
+        var theme = XyhTheme.get();
+
+        /* ── FAB 悬浮按钮（SVG logo，可拖拽记忆位置） ── */
+        var fab = document.createElement('button');
+        fab.id = 'xyh-fab';
+        fab.type = 'button';
+        fab.setAttribute('aria-label', '手写归档');
+        fab.setAttribute('data-theme', theme);
+        fab.innerHTML = XYH_LOGO_SVG;
+        fab.style.cssText = 'position:fixed; right:18px; bottom:18px; z-index:2147483647; width:46px; height:46px;' +
+            'border-radius:14px; border:1px solid rgba(168,85,247,.5); background:linear-gradient(135deg,rgba(168,85,247,.16),rgba(6,182,212,.16))' +
+            ',' + xyhThemeVars(theme).surface + '; cursor:pointer; box-shadow:0 4px 16px rgba(0,0,0,.2); touch-action:none;';
+        xyhRestoreFabPos(fab);
+        xyhMakeDraggable(fab, fab, 'xyh_fab_pos');
+        fab.addEventListener('click', function (ev) {
+            if (fab._dragged) { fab._dragged = false; return; }
+            var p = document.getElementById('xyh-panel');
+            if (p) p.style.display = p.style.display === 'none' ? 'flex' : 'none';
+        });
+        fab.addEventListener('pointerdown', function () { fab._downX = null; });
+        fab.addEventListener('pointermove', function () {});
+
+        /* ── 主面板（xy-panel 风格） ── */
+        var panel = document.createElement('div');
+        panel.id = 'xyh-panel';
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-label', '手写归档面板');
+        panel.style.cssText = 'display:none; position:fixed; right:18px; bottom:74px; z-index:2147483647; width:368px;' +
+            'max-height:min(78vh, 640px); overflow-y:auto; flex-direction:column; border-radius:12px; padding:0;' +
+            'background:var(--xyh-surface); border:1px solid var(--xyh-border); box-shadow:0 16px 48px rgba(0,0,0,.3);' +
+            "font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;";
+
+        var css = document.createElement('style');
+        css.textContent =
+            '#xyh-panel *{box-sizing:border-box;}' +
+            '@media (prefers-reduced-motion: reduce){#xyh-panel,#xyh-fab{transition:none !important;}}' +
+            '#xyh-panel .xyh-head{display:flex; align-items:center; gap:9px; padding:11px 13px; border-bottom:1px solid var(--xyh-border);' +
+                'background:var(--xyh-surface2); border-radius:12px 12px 0 0; user-select:none; touch-action:none;}' +
+            '#xyh-panel .xyh-title{flex:1; font-size:12.5px; font-weight:700; color:var(--xyh-text); letter-spacing:.3px;}' +
+            '#xyh-panel .xyh-icon-btn{border:none; background:transparent; color:var(--xyh-muted); font-size:14px; cursor:pointer;' +
+                'padding:3px 6px; border-radius:7px; line-height:1;}' +
+            '#xyh-panel .xyh-icon-btn:hover{background:var(--xyh-surface2); color:var(--xyh-text);}' +
+            '#xyh-panel .xyh-body{padding:12px 13px; display:flex; flex-direction:column; gap:9px;}' +
+            '#xyh-panel textarea{width:100%; min-height:150px; resize:vertical; padding:9px 11px; font-size:12.5px; line-height:1.65;' +
+                'border-radius:9px; border:1px solid var(--xyh-border); background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
+            '#xyh-panel textarea:focus{border-color:#a855f7; box-shadow:0 0 0 3px rgba(168,85,247,.14);}' +
+            '#xyh-panel input{width:100%; padding:7px 10px; font-size:11.5px; border-radius:8px; border:1px solid var(--xyh-border);' +
+                'background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
+            '#xyh-panel .xyh-meta{display:flex; justify-content:space-between; font-size:10px; color:var(--xyh-muted);}' +
+            '#xyh-panel .xyh-btns{display:flex; gap:8px;}' +
+            '#xyh-panel .xyh-btn{flex:1; min-height:36px; font-size:11.5px; font-weight:600; border-radius:9px; cursor:pointer;' +
+                'display:flex; align-items:center; justify-content:center; gap:5px; transition:box-shadow .15s ease, transform .1s ease;}' +
+            '#xyh-panel .xyh-btn:disabled{opacity:.5; cursor:not-allowed;}' +
+            '#xyh-panel .xyh-btn:not(:disabled):active{transform:translateY(1px);}' +
+            '#xyh-panel .xyh-btn-hinote{border:1px solid rgba(168,85,247,.45); background:rgba(168,85,247,.12); color:#a855f7;}' +
+            '#xyh-panel .xyh-btn-hinote:not(:disabled):hover{box-shadow:0 2px 10px rgba(168,85,247,.3);}' +
+            '#xyh-panel .xyh-btn-pdf{border:1px solid rgba(6,182,212,.45); background:rgba(6,182,212,.12); color:#06b6d4;}' +
+            '#xyh-panel .xyh-btn-pdf:not(:disabled):hover{box-shadow:0 2px 10px rgba(6,182,212,.3);}' +
+            '#xyh-panel .xyh-btn-jpg{border:1px solid var(--xyh-border-light); background:var(--xyh-surface2); color:var(--xyh-text2);}' +
+            '#xyh-panel .xyh-btn-jpg:not(:disabled):hover{box-shadow:0 2px 10px rgba(0,0,0,.12);}' +
+            '#xyh-panel .xyh-status{min-height:16px; font-size:10.5px; color:var(--xyh-muted); line-height:1.5;}' +
+            '#xyh-panel .xyh-foot{font-size:9.5px; color:var(--xyh-muted); line-height:1.6; border-top:1px solid var(--xyh-border);' +
+                'padding:8px 13px 10px;}';
+
+        var head = document.createElement('div');
+        head.className = 'xyh-head';
+        head.innerHTML =
+            '<span aria-hidden="true">' + XYH_LOGO_SVG + '</span>' +
+            '<span class="xyh-title">小雅手写归档</span>' +
+            '<button type="button" id="xyh-theme-toggle" class="xyh-icon-btn" aria-label="切换主题" title="切换主题"></button>' +
+            '<button type="button" id="xyh-minimize" class="xyh-icon-btn" aria-label="收起面板" title="收起">—</button>';
+
+        var body = document.createElement('div');
+        body.className = 'xyh-body';
+        body.innerHTML =
+            '<textarea id="xyh-input" placeholder="把题目、错题、知识点、复习提纲粘贴到这里…&#10;一键变手写 · 自动分页" aria-label="文字内容"></textarea>' +
+            '<div class="xyh-meta"><span id="xyh-count">0 字</span><span>A4 笔记纸 · 自动分页 · 可导入华为笔记</span></div>' +
+            '<input id="xhn-fname" placeholder="文件名（默认：手写归档）" aria-label="文件名">' +
+            '<div class="xyh-btns">' +
+                '<button class="xyh-btn xyh-btn-hinote" data-xhn-fmt="hinote" type="button">📒 .hinote</button>' +
+                '<button class="xyh-btn xyh-btn-pdf" data-xhn-fmt="pdf" type="button">📄 PDF</button>' +
+                '<button class="xyh-btn xyh-btn-jpg" data-xhn-fmt="jpg" type="button">🖼 图片</button>' +
             '</div>' +
-            '<div style="font-size:9.5px; color:#94a3b8; margin-top:7px; line-height:1.5;">纯前端生成 · 常用字走笔顺库，标点与库外字走字体骨架兜底</div>';
-        document.body.appendChild(btn);
+            '<div id="xyh-status" class="xyh-status"></div>';
+
+        var foot = document.createElement('div');
+        foot.className = 'xyh-foot';
+        foot.textContent = '✍️ 笔顺级仿真手写 · 320 字/页自动排版 · 全程本地生成，数据不出浏览器';
+
+        var shadowWrap = panel;
+        shadowWrap.appendChild(css);
+        shadowWrap.appendChild(head);
+        shadowWrap.appendChild(body);
+        shadowWrap.appendChild(foot);
+        xyhApplyTheme(panel, fab, theme);
+
+        document.body.appendChild(fab);
         document.body.appendChild(panel);
-        panel.querySelectorAll('[data-xhn-fmt]').forEach(b => {
-            b.addEventListener('click', () => { void exportAs(b.dataset.xhnFmt); });
+
+        /* 主题切换 */
+        panel.querySelector('#xyh-theme-toggle').addEventListener('click', function () {
+            theme = theme === 'light' ? 'dark' : 'light';
+            XyhTheme.set(theme);
+            xyhApplyTheme(panel, fab, theme);
+        });
+        /* 收起 */
+        panel.querySelector('#xyh-minimize').addEventListener('click', function () {
+            panel.style.display = 'none';
+        });
+        /* 面板标题栏拖拽（跳过按钮） */
+        xyhMakeDraggable(head, panel, 'xyh_panel_pos');
+        try {
+            var pp = JSON.parse(localStorage.getItem('xyh_panel_pos') || 'null');
+            if (pp && pp.l && pp.t) { panel.style.left = pp.l; panel.style.top = pp.t; panel.style.right = 'auto'; panel.style.bottom = 'auto'; }
+        } catch (e) {}
+        /* FAB 拖拽 vs 点击判定 */
+        (function () {
+            var down = null;
+            fab.addEventListener('pointerdown', function (e) { down = { x: e.clientX, y: e.clientY }; });
+            fab.addEventListener('click', function (e) {
+                if (down && (Math.abs(e.clientX - down.x) > 6 || Math.abs(e.clientY - down.y) > 6)) {
+                    e.stopImmediatePropagation();
+                }
+            }, true);
+        })();
+        /* 字数统计 */
+        var ta = panel.querySelector('#xyh-input');
+        var cnt = panel.querySelector('#xyh-count');
+        ta.addEventListener('input', function () {
+            var n = ta.value.replace(/\s/g, '').length;
+            cnt.textContent = n + ' 字' + (n > 0 ? ' · 约 ' + Math.max(1, Math.ceil(n / 320)) + ' 页' : '');
+        });
+        /* 导出按钮 */
+        panel.querySelectorAll('[data-xhn-fmt]').forEach(function (b) {
+            b.addEventListener('click', function () { void exportAs(b.getAttribute('data-xhn-fmt')); });
         });
     }
 
