@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅手写归档
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.6
+// @version      1.0.1
 // @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -2425,7 +2425,7 @@ var XYExport = (function (Hinote) {  'use strict';
             try { localStorage.setItem(this.KEY, t); } catch (e) {}
         }
     };
-    console.log('[小雅手写归档] 引擎加载完成 v1.0.6');
+    console.log('[小雅手写归档] 引擎加载完成 v1.0.1');
 
     // 调试句柄：控制台可用 XyHandwriting.* 手动调用引擎各模块
     try { globalThis.XyHandwriting = { XYPaper: XYPaper, XYHinote: XYHinote, XYExport: XYExport, XY_HW_DB: XY_HW_DB, xyHWRaster: xyHWRaster, xyHWRasterPrinted: xyHWRasterPrinted }; } catch (e) {}
