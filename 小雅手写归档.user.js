@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅手写归档
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.4
+// @version      1.0.5
 // @description  文字转手写笔迹：.hinote（华为笔记导入）/ PDF / JPG 分页。原「小雅辅助工具·笔记版手写导出」引擎完整备份，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -2349,6 +2349,21 @@ var XYExport = (function (Hinote) {  'use strict';
             try { localStorage.setItem(this.KEY, t); } catch (e) {}
         }
     };
+
+    var XyhScope = {
+        KEY: 'xyh_scope',
+        get: function () {
+            try {
+                var raw = (typeof GM_getValue === 'function') ? GM_getValue(this.KEY, '') : localStorage.getItem(this.KEY);
+                var o = raw ? JSON.parse(raw) : {};
+                return { q: o.q !== false, std: o.std !== false, mine: o.mine !== false };
+            } catch (e) { return { q: true, std: true, mine: true }; }
+        },
+        set: function (scope) {
+            try { if (typeof GM_setValue === 'function') GM_setValue(this.KEY, JSON.stringify(scope)); } catch (e) {}
+            try { localStorage.setItem(this.KEY, JSON.stringify(scope)); } catch (e) {}
+        }
+    };
     console.log('[小雅手写归档] 引擎加载完成 v1.0.3');
 
     // 调试句柄：控制台可用 XyHandwriting.* 手动调用引擎各模块
@@ -2418,12 +2433,20 @@ var XYExport = (function (Hinote) {  'use strict';
         if (tg) tg.textContent = theme === 'light' ? '🌙' : '☀️';
     }
 
+    function xyhScopeGet() { var sc = XyhScope.get();
+        ['q', 'std', 'mine'].forEach(function (k) {
+            var el = document.getElementById('xyh-scope-' + k);
+            if (el) sc[k] = el.checked;
+        });
+        return sc;
+    }
+
     async function exportAs(fmt) {
         var autoImages = [];
         var imMap = new Map();
         if (hwQuestionsData && hwQuestionsData.length) {
             var _items = xyExpCollect();
-            var _nt = xyExpNotesText(_items, { q: true, std: true, mine: true }, true);
+            var _nt = xyExpNotesText(_items, xyhScopeGet(), true);
             var text = _nt.text;
             imMap = _nt.imgList.length ? await hwHydrateImageMap(_nt.imgList, 1000, false) : new Map();
             autoImages = xyExpNotesImages(_nt.imgList, imMap);
@@ -2584,6 +2607,11 @@ var XYExport = (function (Hinote) {  'use strict';
         body.className = 'xyh-body';
         body.innerHTML =
             '<div class="xyh-meta" style="margin-bottom:0;"><span id="xyh-count">进入作业页面自动捕获题目</span><span>A4 笔记纸 · 自动分页</span></div>' +
+            '<div class="xyh-scope" style="display:flex; gap:11px; font-size:11px; color:var(--xyh-text2);">' +
+                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-q" style="accent-color:#06b6d4; cursor:pointer;" checked/>题目</label>' +
+                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-std" style="accent-color:#06b6d4; cursor:pointer;" checked/>标准答案</label>' +
+                '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-mine" style="accent-color:#06b6d4; cursor:pointer;" checked/>我的作答</label>' +
+            '</div>' +
             '<input id="xhn-fname" placeholder="文件名（默认：手写归档）" aria-label="文件名">' +
             '<div class="xyh-btns">' +
                 '<button class="xyh-btn xyh-btn-hinote" data-xhn-fmt="hinote" type="button">📒 .hinote</button>' +
@@ -2659,6 +2687,19 @@ var XYExport = (function (Hinote) {  'use strict';
             if (hwQuestionsData.length) { hwUpdateUI(); return; }
             if (getPaperId() || /[?&]paper_id=/.test(location.href)) void hwProactiveFetchData();
         }
+        /* 内容范围：恢复勾选 + 变更持久化 */
+        var sc = XyhScope.get();
+        ['q', 'std', 'mine'].forEach(function (k) {
+            var el = panel.querySelector('#xyh-scope-' + k);
+            if (el) {
+                el.checked = sc[k];
+                el.addEventListener('change', function () {
+                    var cur = { q: panel.querySelector('#xyh-scope-q').checked, std: panel.querySelector('#xyh-scope-std').checked, mine: panel.querySelector('#xyh-scope-mine').checked };
+                    XyhScope.set(cur);
+                    if (!cur.q && !cur.std && !cur.mine) { el.checked = true; XyhScope.set({ q: true, std: true, mine: true }); xyhToast('至少保留一项内容', 'warning'); }
+                });
+            }
+        });
         setTimeout(xyhAutoScan, 800);
         setInterval(xyhAutoScan, 8000);
         hwUpdateUI();
