@@ -1,0 +1,49 @@
+{
+  "version": "1.0.0",
+  "desc": "小雅作业华为笔记导出 · LaTeX → Unicode 线性文本映射表。greek=希腊字母，ops=运算符与符号（脚本内按命令长度降序替换，防 \\le 抢配 \\leq），sup/sub=上/下标字符映射。映射表外置分发，脚本本体不内嵌。",
+  "greek": {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
+    "varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "vartheta": "ϑ",
+    "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ",
+    "pi": "π", "rho": "ρ", "sigma": "σ", "tau": "τ", "upsilon": "υ", "phi": "φ",
+    "varphi": "ϕ", "chi": "χ", "psi": "ψ", "omega": "ω",
+    "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ",
+    "Pi": "Π", "Sigma": "Σ", "Upsilon": "Υ", "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω"
+  },
+  "ops": {
+    "int": "∫", "iint": "∬", "iiint": "∭", "oint": "∮",
+    "sum": "∑", "prod": "∏", "infty": "∞", "partial": "∂", "nabla": "∇",
+    "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠",
+    "approx": "≈", "equiv": "≡", "sim": "∼", "simeq": "≃", "propto": "∝",
+    "in": "∈", "notin": "∉", "subset": "⊂", "subseteq": "⊆", "supset": "⊃",
+    "cup": "∪", "cap": "∩", "forall": "∀", "exists": "∃",
+    "emptyset": "∅", "varnothing": "∅", "neg": "¬", "land": "∧", "lor": "∨",
+    "cdot": "·", "cdots": "⋯", "ldots": "…", "dots": "…",
+    "times": "×", "div": "÷", "pm": "±", "mp": "∓", "circ": "∘",
+    "star": "∗", "ast": "∗", "oplus": "⊕", "otimes": "⊗",
+    "perp": "⊥", "parallel": "∥", "angle": "∠", "degree": "°", "prime": "′",
+    "hbar": "ℏ", "ell": "ℓ", "Re": "ℜ", "Im": "ℑ", "aleph": "ℵ",
+    "quad": "  ", "qquad": "    ",
+    "displaystyle": "", "limits": "", "nolimits": "",
+    "left": "", "right": "", "big": "", "Big": "", "bigg": "", "Bigg": "",
+    "textstyle": "", "scriptstyle": "",
+    "to": "→", "gets": "←", "leftarrow": "←", "rightarrow": "→",
+    "Leftarrow": "⇐", "Rightarrow": "⇒", "Leftrightarrow": "⇔",
+    "mapsto": "↦", "uparrow": "↑", "downarrow": "↓", "iff": "⇔"
+  },
+  "sup": {
+    "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶",
+    "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "=": "⁼",
+    "(": "⁽", ")": "⁾", "n": "ⁿ", "i": "ⁱ",
+    "a": "ᵃ", "b": "ᵇ", "c": "ᶜ", "d": "ᵈ", "e": "ᵉ", "m": "ᵐ", "o": "ᵒ",
+    "p": "ᵖ", "r": "ʳ", "s": "ˢ", "t": "ᵗ", "u": "ᵘ", "v": "ᵛ",
+    "T": "ᵀ", "θ": "ᶿ"
+  },
+  "sub": {
+    "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆",
+    "7": "₇", "8": "₈", "9": "₉", "+": "₊", "-": "₋", "=": "₌",
+    "(": "₍", ")": "₎", "i": "ᵢ", "j": "ⱼ",
+    "a": "ₐ", "e": "ₑ", "o": "ₒ", "x": "ₓ", "k": "ₖ", "m": "ₘ", "n": "ₙ",
+    "p": "ₚ", "s": "ₛ", "t": "ₜ", "θ": "ᶿ"
+  }
+}
