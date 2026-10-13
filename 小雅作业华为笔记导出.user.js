@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅作业华为笔记导出
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.1
+// @version      1.0.2
 // @description  作业题目自动转手写笔迹：打开作业页自动捕获题目，导出 .hinote（华为笔记导入）/ PDF / JPG。原「小雅辅助工具·笔记版手写导出」完整功能，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -13,7 +13,9 @@
 // @run-at       document-start
 // @noframes
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      gitee.com
+// @connect      cdn.jsdmirror.com
 // @grant        GM_getValue
 // @grant        GM_setValue
 // ==/UserScript==
@@ -562,11 +564,11 @@ var XYHinote = (function () {  'use strict';
         return {
           customNotePageContent: {
             pageBookMarks: [], attachment: atts,
-            background: main ? background : '', bkgAttachmentId: '',
+            background: background, bkgAttachmentId: '',
             bkgAttachmentIndex: 0, chapterNumber: '', cloudSyncState: 0,
             createTime: now_ms, guid: '', id: pageId, isDelete: 0,
             lastPageTag: main ? 1 : 0, modifiedTime: now_ms,
-            notesId: notesId, pageColor: main ? page_color : 0,
+            notesId: notesId, pageColor: page_color,
             pageElement: [], pageNumber: number,
             pageOrientation: main ? 1 : 0, pageRatio: main ? 0.625 : 1,
             pageType: 1, thumbnail: '', unStructUuid: '',
@@ -1041,12 +1043,29 @@ var XYLayout = (function (Hinote) {  'use strict';
           var w = Math.min(im.w, contentW - 2 * pad);
           var h = w * (im.h / Math.max(1, im.w));
           if (h > bandH - 2 * pad) { h = Math.max(1, bandH - 2 * pad); w = h * (im.w / Math.max(1, im.h)); }
-          imgLayout.push({
-            idx: bi, page: pageOfRow(row),
+          var _fl = { idx: bi, page: pageOfRow(row),
             x: X0 + (contentW - w) / 2,
             y: bandTop + (bandH - h) / 2,
-            w: w, h: h
-          });
+            w: w, h: h };
+          imgLayout.push(_fl);
+          /* [FORMULA-FIX] 公式位图 → 骨架笔迹：thin + traceStrokes 后缩放平移到
+           * imgLayout 定位（与图片同位同缩放），使 .hinote（纯笔迹格式）里公式可见。 */
+          if (im.bitmap && im.bitmap.data) {
+            var ba = new Uint8Array(im.bitmap.data.length);
+            for (var bq = 0; bq < ba.length; bq++) ba[bq] = im.bitmap.data[bq] > 128 ? 1 : 0;
+            thin(ba, im.bitmap.w, im.bitmap.h);
+            var fpaths = traceStrokes(ba, im.bitmap.w, im.bitmap.h);
+            var fsx = _fl.w / im.bitmap.w, fsy = _fl.h / im.bitmap.h;
+            for (var fp = 0; fp < fpaths.length; fp++) {
+              var fpts = fpaths[fp];
+              if (!fpts || fpts.length < 2) continue;
+              var fpts2 = [];
+              for (var fq = 0; fq < fpts.length; fq++) {
+                fpts2.push([_fl.x + fpts[fq][0] * fsx, _fl.y + fpts[fq][1] * fsy, 0, 0.021]);
+              }
+              strokes.push(new Hinote.Stroke(fpts2, ink));
+            }
+          }
         }
         row += br; x = 0.0; first = true;
         continue;
@@ -1236,7 +1255,7 @@ var XYPaper = (function (Hinote, Layout) {  'use strict';
         var w = Math.max(1, im.w || 100), h = Math.max(1, im.h || 100);
         var br = Math.max(1, Math.ceil(h / ROW_H) + 1);
         if (br > BODY_ROWS - 1) br = BODY_ROWS - 1;
-        return { src: im.src, w: w, h: h, blockRows: br };
+        return { src: im.src, w: w, h: h, blockRows: br, bitmap: im.bitmap || null };
       });
     }
     var common = {
@@ -1506,6 +1525,47 @@ var XYExport = (function (Hinote) {  'use strict';
         return xyhDbReady;
     }
 
+    /* LaTeX → Unicode 线性化映射表（xy-hw-tex.json）：希腊字母 / 运算符 / 上下标
+     * 全部外置分发，脚本本体不内嵌映射数据。加载方式与笔顺库一致：
+     * GM 特权拉取 + 版本缓存 + 懒加载；加载失败静默降级（仅保留结构命令兜底）。 */
+    var _XY_HW_TEX = null;
+    var XY_HW_TEX_URL = 'https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/xy-hw-tex.json';
+    var xyhTexReady = null;
+    /* 结构命令兜底：仅排版控制符（非字符映射），映射表未就绪时保证 \left 等不被剥成残留文字 */
+    var _XY_HW_TEX_CORE_OPS = { left: '', right: '', big: '', Big: '', bigg: '', Bigg: '', displaystyle: '', textstyle: '', scriptstyle: '', limits: '', nolimits: '' };
+    function xyhTexCacheKey() { return 'xyh_tex_' + (typeof GM_info !== 'undefined' && GM_info.script ? GM_info.script.version : '0'); }
+    function xyhLoadTexMap() {
+        if (xyhTexReady) return xyhTexReady;
+        try {
+            var cached = (typeof GM_getValue === 'function') ? GM_getValue(xyhTexCacheKey(), '') : '';
+            if (cached) { _XY_HW_TEX = JSON.parse(cached); xyhTexReady = Promise.resolve(_XY_HW_TEX); return xyhTexReady; }
+        } catch (e) { /* 缓存读取失败走网络 */ }
+        xyhTexReady = new Promise(function (resolve) {
+            var attempt = 0;
+            var run = function () {
+                attempt++;
+                var done = function (map) {
+                    _XY_HW_TEX = map;
+                    try { if (typeof GM_setValue === 'function' && map) GM_setValue(xyhTexCacheKey(), JSON.stringify(map)); } catch (e) {}
+                    resolve(map);
+                };
+                var giveUp = function (why) { xyhTexReady = null; resolve(null); };
+                GM_xmlhttpRequest({
+                    method: 'GET', url: XY_HW_TEX_URL, timeout: 30000,
+                    onload: function (r) {
+                        if (r.status !== 200 || !r.responseText) { if (attempt >= 3) return giveUp('映射表 HTTP ' + r.status); return setTimeout(run, 1500); }
+                        try { done(JSON.parse(r.responseText)); }
+                        catch (e) { if (attempt >= 3) return giveUp('映射表解析失败'); setTimeout(run, 1500); }
+                    },
+                    onerror: function () { if (attempt >= 3) return giveUp('映射表网络错误'); setTimeout(run, 1500); },
+                    ontimeout: function () { if (attempt >= 3) return giveUp('映射表加载超时'); setTimeout(run, 1500); }
+                });
+            };
+            run();
+        });
+        return xyhTexReady;
+    }
+
     /* 应用内更新提醒：拉取 hw-script.latest.json 比对版本，6 小时频控。
      * 脚本管理器另有 @updateURL 自动更新，此提示兜底让用户感知更新内容。 */
     function xyhCheckUpdate() {
@@ -1531,6 +1591,121 @@ var XYExport = (function (Hinote) {  'use strict';
             });
         } catch (e) {}
     }
+
+    /* ---------- 应用内「检查更新」按钮 + 弹窗（交互对齐小雅辅助工具） ----------
+     * 手动检查绕过 6h 频控；清单含 installUrl（新版一键跳安装页）与 notes 更新日志。 */
+    var XYH_LATEST_URL = 'https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/hw-script.latest.json';
+    var XYH_INSTALL_URL = 'https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js';
+    var _xyhUpdState = { checking: false, info: null, error: '' };
+    var _xyhUpdModal = null;
+    function xyhCurVer() { return (typeof GM_info !== 'undefined' && GM_info.script) ? GM_info.script.version : ''; }
+    function xyhCmpVer(a, b) {
+        var pa = String(a || '').split('.'), pb = String(b || '').split('.');
+        for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
+            var x = parseInt(pa[i], 10) || 0, y = parseInt(pb[i], 10) || 0;
+            if (x !== y) return x - y;
+        }
+        return 0;
+    }
+    function xyhEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function xyhThemeNow() {
+        var f = document.getElementById('xyh-fab');
+        return (f && f.getAttribute('data-theme') === 'light') ? 'light' : 'dark';
+    }
+    function xyhUpdHasNew() {
+        var info = _xyhUpdState.info;
+        return !!(info && info.version && xyhCmpVer(info.version, xyhCurVer()) > 0);
+    }
+    function xyhUpdFetch() {
+        _xyhUpdState.checking = true; _xyhUpdState.error = '';
+        xyhUpdRender();
+        GM_xmlhttpRequest({
+            method: 'GET', url: XYH_LATEST_URL + '?t=' + Date.now(), timeout: 20000,
+            onload: function (r) {
+                _xyhUpdState.checking = false;
+                if (r.status !== 200 || !r.responseText) { _xyhUpdState.error = 'HTTP ' + r.status; xyhUpdRender(); return; }
+                try { _xyhUpdState.info = JSON.parse(r.responseText); }
+                catch (e) { _xyhUpdState.error = '清单解析失败'; }
+                xyhUpdRender();
+            },
+            onerror: function () { _xyhUpdState.checking = false; _xyhUpdState.error = '网络错误（Gitee 不可达）'; xyhUpdRender(); },
+            ontimeout: function () { _xyhUpdState.checking = false; _xyhUpdState.error = '检查超时'; xyhUpdRender(); }
+        });
+    }
+    function xyhUpdRender() {
+        if (!_xyhUpdModal || !document.body.contains(_xyhUpdModal)) return;
+        var box = _xyhUpdModal.querySelector('#xyh-upd-box');
+        if (!box) return;
+        var v = xyhThemeVars(xyhThemeNow());
+        var dark = xyhThemeNow() === 'dark';
+        var T = function (dk, lt) { return dark ? dk : lt; };
+        var cur = xyhCurVer() || '-';
+        var info = _xyhUpdState.info || {};
+        var latest = info.version || '-';
+        var hasNew = xyhUpdHasNew();
+        var statusText = _xyhUpdState.checking ? '⏳ 正在检查更新...'
+            : (_xyhUpdState.error ? ('❌ 检查失败：' + _xyhUpdState.error)
+            : (info.version ? (hasNew ? ('🎉 发现新版本 v' + latest) : '✅ 当前已是最新版本') : '尚未检查'));
+        var statusColor = _xyhUpdState.error ? '#f87171' : (hasNew ? '#34d399' : T('#818cf8', '#4f46e5'));
+        var notes = Array.isArray(info.notes) ? info.notes : [];
+        var notesHtml = notes.length
+            ? '<div style="margin-bottom:14px; padding:11px 13px; background:' + T('rgba(129,140,248,0.08)', '#f8fafc') + '; border:1px solid ' + T('rgba(71,85,105,0.3)', '#e2e8f0') + '; border-radius:10px;">' +
+              '<div style="font-size:12px; font-weight:700; color:' + v.text + '; margin-bottom:6px;">📋 更新内容</div>' +
+              '<ul style="margin:0; padding-left:18px; color:' + v.text2 + '; line-height:1.7; font-size:12px;">' +
+              notes.map(function (n) { return '<li style="margin:2px 0;">' + xyhEsc(n) + '</li>'; }).join('') + '</ul></div>'
+            : '';
+        box.innerHTML =
+            '<div style="background:' + v.surface + '; border:1px solid ' + v.border + '; border-radius:14px; width:400px; max-width:92%; max-height:82vh; overflow-y:auto; padding:22px; box-shadow:0 20px 50px rgba(0,0,0,0.35); position:relative;">' +
+                '<div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">' +
+                    '<div style="width:38px; height:38px; border-radius:10px; background:' + T('rgba(129,140,248,0.12)', '#eef2ff') + '; display:flex; align-items:center; justify-content:center; font-size:19px;">↻</div>' +
+                    '<div><div style="color:' + v.text + '; font-size:15.5px; font-weight:700;">脚本更新</div>' +
+                    '<div style="color:' + v.muted + '; font-size:11px; margin-top:2px;">通过 Gitee 版本清单检查，交由脚本管理器安装</div></div>' +
+                '</div>' +
+                '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:13px;">' +
+                    '<div style="background:' + v.surface2 + '; border:1px solid ' + v.border + '; border-radius:10px; padding:12px;">' +
+                        '<div style="font-size:10.5px; font-weight:700; color:' + v.muted + '; margin-bottom:4px;">当前版本</div>' +
+                        '<div style="color:' + T('#818cf8', '#4f46e5') + '; font-size:20px; font-weight:800;">' + xyhEsc(cur) + '</div></div>' +
+                    '<div style="background:' + v.surface2 + '; border:1px solid ' + (hasNew ? '#34d39966' : v.border) + '; border-radius:10px; padding:12px;">' +
+                        '<div style="font-size:10.5px; font-weight:700; color:' + v.muted + '; margin-bottom:4px;">最新版本</div>' +
+                        '<div style="color:' + (hasNew ? '#34d399' : T('#818cf8', '#4f46e5')) + '; font-size:20px; font-weight:800;">' + xyhEsc(latest) + '</div></div>' +
+                '</div>' +
+                '<div style="color:' + statusColor + '; font-size:12.5px; font-weight:700; margin-bottom:12px;">' + statusText + '</div>' +
+                notesHtml +
+                '<div style="display:flex; gap:9px; justify-content:flex-end; flex-wrap:wrap;">' +
+                    '<button id="xyh-upd-close" style="padding:8px 16px; border:1px solid ' + v.border + '; background:transparent; color:' + v.text2 + '; border-radius:8px; font-size:12px; font-weight:600; cursor:pointer; font-family:inherit;">关闭</button>' +
+                    '<button id="xyh-upd-check" style="padding:8px 16px; border:1px solid ' + T('rgba(129,140,248,0.4)', '#c7d2fe') + '; background:' + T('rgba(129,140,248,0.1)', '#eef2ff') + '; color:' + T('#a5b4fc', '#4f46e5') + '; border-radius:8px; font-size:12px; font-weight:600; cursor:pointer; font-family:inherit;"' + (_xyhUpdState.checking ? ' disabled' : '') + '>' + (_xyhUpdState.checking ? '⏳ 检查中...' : '↻ 重新检查') + '</button>' +
+                    '<button id="xyh-upd-open"' + (hasNew ? '' : ' disabled') + ' style="padding:8px 16px; border:none; background:' + (hasNew ? 'linear-gradient(135deg,#818cf8,#6366f1)' : T('rgba(71,85,105,0.3)', '#e2e8f0')) + '; color:' + (hasNew ? '#fff' : v.muted) + '; border-radius:8px; font-size:12px; font-weight:600; cursor:' + (hasNew ? 'pointer' : 'not-allowed') + '; font-family:inherit;">' + (hasNew ? '⬇ 打开安装页' : '已是最新') + '</button>' +
+                '</div>' +
+            '</div>';
+        var bClose = box.querySelector('#xyh-upd-close');
+        if (bClose) bClose.onclick = function (e) { e.stopPropagation(); xyhUpdClose(); };
+        var bCheck = box.querySelector('#xyh-upd-check');
+        if (bCheck) bCheck.onclick = function (e) { e.stopPropagation(); if (!_xyhUpdState.checking) xyhUpdFetch(); };
+        var bOpen = box.querySelector('#xyh-upd-open');
+        if (bOpen) bOpen.onclick = function (e) {
+            e.stopPropagation();
+            if (!xyhUpdHasNew()) return;
+            var url = (_xyhUpdState.info && _xyhUpdState.info.installUrl) || XYH_INSTALL_URL;
+            try { window.open(url, '_blank'); } catch (e2) { GM_openInTab(url, { active: true }); }
+        };
+    }
+    function xyhUpdClose() {
+        if (_xyhUpdModal && _xyhUpdModal.parentNode) _xyhUpdModal.parentNode.removeChild(_xyhUpdModal);
+        _xyhUpdModal = null;
+    }
+    function xyhUpdOpen() {
+        if (!document.body) return;
+        if (_xyhUpdModal && document.body.contains(_xyhUpdModal)) { xyhUpdRender(); return; }
+        var mask = document.createElement('div');
+        mask.style.cssText = 'position:fixed; top:0; left:0; right:0; bottom:0; display:flex; align-items:center; justify-content:center; z-index:2147483647; padding:20px; background:rgba(0,0,0,0.45);';
+        mask.appendChild(document.createElement('div')).id = 'xyh-upd-box';
+        mask.addEventListener('click', function (e) { if (e.target === mask) xyhUpdClose(); });
+        document.body.appendChild(mask);
+        _xyhUpdModal = mask;
+        xyhUpdRender();
+        if (!_xyhUpdState.info && !_xyhUpdState.checking) xyhUpdFetch();
+    }
+
     /* ================================================================
      * §14 手写纸引擎（XYHinote / XYLayout / XYPaper / XYExport + XY_HW_DB）
      * ----------------------------------------------------------------
@@ -2594,6 +2769,7 @@ var XYExport = (function (Hinote) {  'use strict';
         }
         if (!text) { xyhToast('还未捕获到作业题目，请先打开作业/试卷页面', 'warning'); return; }
         try { await xyhLoadDb(); } catch (e) { xyhToast('笔顺库加载失败：' + ((e && e.message) || e), 'error'); return; }
+        await xyhLoadTexMap(); /* 公式映射表，失败静默降级 */
         var btns = document.querySelectorAll('[data-xhn-fmt]');
         btns.forEach(function (b) { b.disabled = true; });
         var st = document.getElementById('xyh-status');
@@ -2608,7 +2784,7 @@ var XYExport = (function (Hinote) {  'use strict';
             var rawName = (document.getElementById('xhn-fname') && document.getElementById('xhn-fname').value) || '手写归档';
             var title = rawName.replace(/[\\/:*?"<>|]/g, '_') + '_' + xyhStamp();
             if (fmt === 'hinote') {
-                var buf = await XYHinote.writeHinote(res.strokes, { title: title });
+                var buf = await XYHinote.writeHinote(res.strokes, { title: title, pageColor: -1 });
                 xyhSaveBlob(new Blob([buf], { type: 'application/octet-stream' }), title + '.hinote');
                 xyhToast('✅ 已导出 ' + title + '.hinote（' + res.stats.pages + ' 页）', 'success');
             } else {
@@ -2631,6 +2807,383 @@ var XYExport = (function (Hinote) {  'use strict';
                 }
             }
             if (st) { st.textContent = '✅ 上次导出：' + res.stats.chars + ' 字 / ' + res.stats.pages + ' 页'; st.style.opacity = '.85'; }
+        } catch (e) {
+            xyhToast('导出失败：' + ((e && e.message) || e), 'error');
+            if (st) { st.textContent = '❌ 导出失败'; }
+        } finally {
+            btns.forEach(function (b) { b.disabled = false; });
+        }
+    }
+
+    /* ================= 文字 / Markdown → 手写 =================
+     * 借鉴：matt-bat/programmatic-text-to-handwriting（MD → 块解析 → 逐块渲染·确定性种子）、
+     * RustyPiano/Markdown2Handwrite（块解析先行再渲染）、本地 remark-docx fork（块类型集合）。
+     * 三段式：MD 块解析 → 块到排版文本映射（■ 标题/• 列表/缩进代码/引用前缀）→ 交给
+     * XYPaper.build 现有手写引擎，引擎零改动。 */
+    function xyhMdInline(t) {
+        return String(t || '')
+            .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+            .replace(/\*\*\*([^*]+)\*\*\*/g, '$1')
+            .replace(/\*\*([^*]+)\*\*/g, '$1')
+            .replace(/__([^_]+)__/g, '$1')
+            .replace(/\*([^*]+)\*/g, '$1')
+            .replace(/~~([^~]+)~~/g, '$1')
+            .replace(/`([^`]+)`/g, '$1');
+    }
+
+    function xyhMdParse(md) {
+        var rows = String(md || '').replace(/\r\n/g, '\n').split('\n');
+        var blocks = [], inCode = false, codeBuf = [];
+        var listRe = /^(\s*)([-*+]|\d+[.、)])\s+(.*)$/;
+        for (var i = 0; i < rows.length; i++) {
+            var ln = rows[i];
+            if (/^```/.test(ln.trim())) {
+                if (!inCode) { inCode = true; codeBuf = []; }
+                else { blocks.push({ t: 'code', text: codeBuf.join('\n') }); inCode = false; }
+                continue;
+            }
+            if (inCode) { codeBuf.push(ln); continue; }
+            var t = ln.trim();
+            /* [MD-LAYOUT] 空行保留为 blank 块——作者分段意图，转文本时作段落间距 */
+            if (!t) { blocks.push({ t: 'blank' }); continue; }
+            var h = t.match(/^(#{1,6})\s+(.*)$/);
+            if (h) { blocks.push({ t: 'h', level: Math.min(h[1].length, 3), text: xyhMdInline(h[2]) }); continue; }
+            if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) { blocks.push({ t: 'hr' }); continue; }
+            var q = t.match(/^>\s?(.*)$/);
+            if (q) { blocks.push({ t: 'quote', text: xyhMdInline(q[1]) }); continue; }
+            var li = ln.match(listRe);
+            /* [MD-FIX] 无空格星号列表（*要点——网页/聊天复制常见丢空格形态），
+             * 仅当 * 后紧跟非空白非 * 才认定，防误伤 **粗体** 与乘号 */
+            if (!li && /^\*[^*\s]/.test(t)) li = [t, '', '*', t.slice(1)];
+            if (li) {
+                var depth = Math.floor(li[1].replace(/\t/g, '  ').length / 2);
+                var ordered = /\d/.test(li[2]);
+                blocks.push({ t: 'li', depth: Math.min(depth, 2), mark: ordered ? li[2] : '•', text: xyhMdInline(li[3]) });
+                continue;
+            }
+            blocks.push({ t: 'p', text: xyhMdInline(t) });
+        }
+        if (inCode && codeBuf.length) blocks.push({ t: 'code', text: codeBuf.join('\n') });
+        return blocks;
+    }
+
+    function xyhDetectMd(text) {
+        if (!text) return false;
+        var n = 0;
+        String(text).split('\n').forEach(function (l) {
+            if (/^#{1,6}\s/.test(l) || /^```/.test(l) || /^[-*+]\s/.test(l) || /^\d+[.、)]\s/.test(l) || /^>\s/.test(l)) n++;
+            /* 行内标记（粗体/删除线）与无空格星号列表同样算 MD 特征——
+             * 修「纯段落带 **粗体** 却走纯文本路径遗留星号」问题 */
+            else if (/\*\*[^*]+\*\*/.test(l) || /~~[^~]+~~/.test(l) || /^\*[^*\s]/.test(l)) n++;
+        });
+        return n >= 1;
+    }
+
+    function xyhBlocksToText(blocks) {
+        var out = [];
+        blocks.forEach(function (b) {
+            var pad = b.depth ? new Array(b.depth + 1).join('　') : '';
+            if (b.t === 'blank') { out.push(''); return; }
+            /* [MD-LAYOUT] 结构块（标题/代码/引用/分割线）前自动空一行，与正文呼吸分隔 */
+            if ((b.t === 'h' || b.t === 'hr' || b.t === 'code' || b.t === 'quote') && out.length && out[out.length - 1] !== '') out.push('');
+            if (b.t === 'h') {
+                out.push((b.level === 1 ? '■ ' : b.level === 2 ? '◆ ' : '· ') + b.text);
+                out.push(''); /* 标题后空一行 */
+            }
+            else if (b.t === 'li') out.push(pad + b.mark + ' ' + b.text);
+            else if (b.t === 'code') {
+                out.push('── 代码 ──');
+                b.text.split('\n').forEach(function (cl) { out.push('　' + cl); });
+                out.push('────────');
+                out.push('');
+            }
+            else if (b.t === 'quote') out.push('▍ ' + b.text);
+            else if (b.t === 'hr') out.push('────────────');
+            else out.push(b.text);
+        });
+        /* [MD-LAYOUT] 归一：连续空行压成一行、去首尾空行——空行只作段落间距不堆叠 */
+        var res = [];
+        for (var i = 0; i < out.length; i++) {
+            if (out[i] === '' && (res.length === 0 || res[res.length - 1] === '')) continue;
+            res.push(out[i]);
+        }
+        while (res.length && res[res.length - 1] === '') res.pop();
+        return res.join('\n');
+    }
+
+    /* ================= LaTeX 公式 → 手写笔迹 =================
+     * 方案参考 GitHub 通用管线（MathJax v3 tex2svg → SVG → Image → canvas 逐像素，
+     * 见 texsvg / dsh-latex-tools）：SVG 自包含 path 无字体依赖，境内走 jsdmirror。
+     * 位图格式与 xyHWRasterPrinted 同构（透明底+白字，亮=墨迹），导出层经
+     * thin → traceStrokes 转真笔迹——.hinote（纯笔迹格式）里公式同样有效。 */
+    var XYH_MJ_URL = 'https://cdn.jsdmirror.com/npm/mathjax@3.2.2/es5/tex-svg.js';
+    var _xyhMjReady = null;
+    var _xyhMjEngine = null;   /* 就绪后的 MathJax 引擎引用（页面上下文或沙箱） */
+
+    /** MathJax v3 配置：必须在脚本执行前就位；fontCache='none' 让每个 SVG 自包含
+     * path，否则 dataURL 化后 <use> 引用全局缓存失效，导出空白。 */
+    function xyhMjConfig() {
+        return {
+            svg: { fontCache: 'none' },
+            tex: { packages: { '[+]': ['ams'] } },
+            startup: { typeset: false },
+            options: { enableMenu: false }
+        };
+    }
+
+    /** 公式引擎加载（script 注入 + unsafeWindow，CDP 真机验证）：
+     * 真实站点页面实测：script 注入 jsdmirror 655ms、CSP 未拦截、tex2svg 5/5 全过。
+     * GM eval 沙箱通道真机失败（MathJax 大包在脚本沙箱内初始化异常）→ 弃用。
+     * MathJax 运行在页面上下文，通过 unsafeWindow.MathJax 访问。 */
+    function xyhLoadMathJax() {
+        if (_xyhMjReady) return _xyhMjReady;
+        _xyhMjReady = new Promise(function (resolve, reject) {
+            var UW = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+            try { if (!UW.MathJax) UW.MathJax = xyhMjConfig(); } catch (e) { /* 只读时忽略 */ }
+            var sc = document.createElement('script');
+            sc.src = XYH_MJ_URL;
+            sc.onload = function () {
+                console.log('[小雅作业华为笔记导出] 公式引擎脚本加载完成，等待初始化…');
+                var _mjTries = 0;
+                (function _mjWait() {
+                    if (UW.MathJax && UW.MathJax.tex2svg) { _xyhMjEngine = UW.MathJax; resolve(UW.MathJax); return; }
+                    if (++_mjTries > 100) { _xyhMjReady = null; reject(new Error('MathJax 初始化超时（10s）')); return; }
+                    setTimeout(_mjWait, 100);
+                })();
+            };
+            sc.onerror = function () { _xyhMjReady = null; reject(new Error('MathJax 脚本加载失败（网络或 CSP）')); };
+            document.head.appendChild(sc);
+        });
+        return _xyhMjReady;
+    }
+
+    /** LaTeX → Unicode 线性文本：公式不再走 MathJax 位图（与手写风格不搭、链路
+     * 脆弱），改为线性化后并入正文，走与其他文字完全相同的手写笔迹引擎——
+     * 手写笔记场景下分式写 a/b、上标写 ² 完全符合真实书写习惯。 */
+    function xyhTexToLinear(tex) {
+        var t = String(tex || '');
+        /* 映射表外置（xy-hw-tex.json）：希腊字母 / 运算符 / 上下标均不内嵌脚本。
+         * 未加载成功时仅保留结构命令兜底，公式结构转换（分式/根号/上下标剥除）不受影响。 */
+        var MAP = _XY_HW_TEX || {};
+        var greek = MAP.greek || {};
+        var ops = {}, _k;
+        for (_k in _XY_HW_TEX_CORE_OPS) ops[_k] = _XY_HW_TEX_CORE_OPS[_k];
+        for (_k in (MAP.ops || {})) ops[_k] = MAP.ops[_k];
+        var sup = MAP.sup || {};
+        var sub = MAP.sub || {};
+        Object.keys(greek).forEach(function (k) { t = t.split('\\' + k).join(greek[k]); });
+        /* 运算符：命令长度降序替换，防 \le 抢配 \leq */
+        Object.keys(ops).sort(function (a, b) { return b.length - a.length; }).forEach(function (k) { t = t.split('\\' + k).join(ops[k]); });
+        /* 数学函数名保留原文（cos/sin/tan/lim/log/ln/max/min/exp） */
+        /* 上下标 → Unicode 上/下标（常见单字符与数字）；无对应时保留 ^ x 原样 */
+        function supSub(re, table) {
+            t = t.replace(re, function (m, body) {
+                body = body.trim();
+                /* 整段可映射则全转，否则保留原记法 */
+                var ok = true, mapped = '';
+                for (var q = 0; q < body.length; q++) {
+                    var ch = body[q];
+                    if (table[ch]) mapped += table[ch];
+                    else if (ch === ' ') { mapped += ''; }
+                    else { ok = false; break; }
+                }
+                return ok ? mapped : m;
+            });
+        }
+        supSub(/\^\{([^{}]*)\}/g, sup);
+        supSub(/\^(\S)/g, sup);
+        supSub(/_\{([^{}]*)\}/g, sub);
+        supSub(/_(\S)/g, sub);
+        /* 分式 → (分子)/(分母)：反复处理最内层（嵌套 \frac 由内向外） */
+        var guard = 0;
+        while (t.indexOf('\\frac') !== -1 && guard++ < 20) {
+            t = t.replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, function (m, a, b) {
+                return '(' + a.trim() + ')/(' + b.trim() + ')';
+            });
+        }
+        /* 根号：\sqrt{x} → √(x)；\sqrt[n]{x} → ⁿ√(x) */
+        t = t.replace(/\\sqrt\s*\[([^\]]*)\]\s*\{([^{}]*)\}/g, function (m, n, x) { return (sup[n] || '^(' + n + ')') + '√(' + x.trim() + ')'; });
+        t = t.replace(/\\sqrt\s*\{([^{}]*)\}/g, function (m, x) { return '√(' + x.trim() + ')'; });
+        /* 定界符与修饰清理 */
+        t = t.replace(/\\left\s*\\\{/g, '{').replace(/\\right\s*\\\}/g, '}');
+        t = t.replace(/\\left\s*\[/g, '[').replace(/\\right\s*\]/g, ']');
+        t = t.replace(/\\left\s*\|/g, '|').replace(/\\right\s*\|/g, '|');
+        t = t.replace(/\\left\s*\./g, '').replace(/\\right\s*\./g, '');
+        t = t.replace(/\\(text|mathrm|mathbf|mathit)\s*\{([^{}]*)\}/g, '$2');
+        t = t.replace(/\\(,|;|:|!)/g, ' ');
+        t = t.replace(/\\\\/g, '；');
+        t = t.replace(/\\overline\s*\{([^{}]*)\}/g, 'overline($1)');
+        t = t.replace(/\\hat\s*\{([^{}]*)\}/g, '$1^');
+        t = t.replace(/\\vec\s*\{([^{}]*)\}/g, '$1→');
+        /* 残留命令兜底：未知 \command 直接剥掉反斜杠保留名字 */
+        t = t.replace(/\\([a-zA-Z]+)/g, '$1');
+        t = t.replace(/[{}]/g, '');
+        /* 多空格归一 */
+        t = t.replace(/ {3,}/g, '  ');
+        return t.trim();
+    }
+    /** 提取 $..$（块级）与 $..$（行内）公式，替换为图片占位符（复用图片占行机制）。
+     * 规则：$ 后非空白且配对侧非数字，避免「价格 $5」误判。 */
+    function xyhExtractFormulas(text) {
+        /* 公式 → 线性手写文本：不再走 MathJax 位图/占位符/引擎加载整条链，
+         * 公式与正文共用同一手写笔迹引擎（风格统一）。formulas 恒空使
+         * 调用点的引擎加载/光栅化分支自然短路（保留以兼容结构）。 */
+        var t = String(text || '');
+        var n = 0;
+        t = t.replace(/\$\$([\s\S]+?)\$\$/g, function (m, f) { n++; return '\n' + xyhTexToLinear(f) + '\n'; });
+        t = t.replace(/\$(\S(?:[^$\n]*\S)?)\$/g, function (m, f) {
+            var core = f.trim();
+            if (!core) return m;
+            n++;
+            return xyhTexToLinear(core);
+        });
+        /* [MD-LAYOUT] 排版归一：块级公式自带前后空行，与正文不粘连；
+         * 行尾空白清除、连续空行压成一个、去首尾空行 */
+        t = t.replace(/[ \t]+\n/g, '\n');
+        t = t.replace(/\n{3,}/g, '\n\n');
+        t = t.replace(/^\n+/, '').replace(/\n+$/, '');
+        return { text: t, formulas: [], count: n };
+    }
+
+    /** 公式 → 光栅位图：tex2svg → SVG（白字，亮=墨迹）→ dataURL → Image → canvas 灰度。 */
+    function xyhRasterFormula(latex, display) {
+        return new Promise(function (resolve, reject) {
+            var svg;
+            try {
+                if (!_xyhMjEngine) throw new Error('公式引擎未就绪');
+                var node = _xyhMjEngine.tex2svg(latex, { display: !!display });
+                svg = node.firstElementChild;
+                if (!svg || svg.tagName.toLowerCase() !== 'svg') throw new Error('tex2svg 无输出');
+                svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+                /* 不设 color：MathJax glyph 默认黑字（不赌 currentColor 行为），
+                 * 画布填白底后按「暗=墨迹」二值化，与栅格格式等价。 */
+            } catch (e) { reject(e); return; }
+            var vb = svg.viewBox && svg.viewBox.baseVal;
+            var vw = (vb && vb.width) || 300, vh = (vb && vb.height) || 100;
+            /* 尺寸防御：位图最大边限 400px（真实复杂公式 SVG 可达数百 pt，无限制时大位图消耗过大）；小 SVG 最多 3x 超采样 */
+            var scale = Math.min(3, 400 / Math.max(vw, vh));
+            if (scale < 0.05) scale = 0.05;
+            var cw = Math.max(8, Math.round(vw * scale)), chh = Math.max(8, Math.round(vh * scale));
+            var url = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg.outerHTML)));
+            var img = new Image();
+            img.onload = function () {
+                try {
+                    var cv = document.createElement('canvas');
+                    cv.width = cw; cv.height = chh;
+                    var g = cv.getContext('2d', { willReadFrequently: true });
+                    g.fillStyle = '#fff';
+                    g.fillRect(0, 0, cw, chh);                  /* 白底：黑字公式与底形成对比 */
+                    g.drawImage(img, 0, 0, cw, chh);
+                    var d = g.getImageData(0, 0, cw, chh).data;
+                    var out = new Uint8Array(cw * chh);
+                    var inkN = 0;
+                    for (var i = 0; i < out.length; i++) {
+                        /* 暗=墨迹：输出 0/255 二值，与栅格格式（>128=墨迹）完全同构 */
+                        out[i] = d[i * 4] < 128 ? 255 : 0;
+                        if (out[i]) inkN++;
+                    }
+                    if (inkN < out.length * 0.0005) throw new Error('公式渲染空白（MathJax 输出未落墨）');
+                    resolve({ w: cw, h: chh, data: out, dataUrl: url });
+                } catch (e) { reject(e); }
+            };
+            img.onerror = function () { reject(new Error('公式 SVG 加载失败')); };
+            img.src = url;
+        });
+    }
+
+    /** 文字/Markdown → 手写（双模式）：plain=纯文字面板所见即所得（零解析零剥除，
+     * 公式也不处理）；MD=结构化解析 + LaTeX 公式 → MathJax 笔迹。 */
+    async function xyhExportText(fmt, plain) {
+        var ta = document.getElementById(plain ? 'xyh-text-input' : 'xyh-md-input');
+        var raw = (ta && ta.value || '').trim();
+        if (!raw) { xyhToast(plain ? '请先粘贴文字内容' : '请先粘贴 Markdown 内容', 'warning'); return; }
+        try { await xyhLoadDb(); } catch (e) { xyhToast('笔顺库加载失败：' + ((e && e.message) || e), 'error'); return; }
+        await xyhLoadTexMap(); /* 公式映射表，失败静默降级 */
+        var st0 = document.getElementById(plain ? 'xyh-text-status' : 'xyh-md-status');
+        /* [SPLIT] 双面板分离：纯文字面板所见即所得；Markdown 面板永远走结构化解析。 */
+        var text = raw, blockCount = 0;
+        if (!plain) {
+            var blocks = xyhMdParse(raw);
+            blockCount = blocks.length;
+            text = xyhBlocksToText(blocks);
+        }
+        var btns = document.querySelectorAll(plain ? '[data-xhn-text-fmt]' : '[data-xhn-md-fmt]');
+        btns.forEach(function (b) { b.disabled = true; });
+        var st = st0;
+        if (st) { st.textContent = '⏳ 正在生成' + (fmt === 'hinote' ? ' .hinote' : fmt === 'pdf' ? ' PDF' : ' 图片') + '…'; st.style.opacity = '1'; }
+        /* [FORMULA-FIX] LaTeX 公式提取（仅 Markdown 面板）：$$..$$ 与 $..$ → 占位符，
+         * MathJax 光栅化转真笔迹；纯文字面板所见即所得，不做公式处理。 */
+        var ext = plain ? { formulas: [], text: text } : xyhExtractFormulas(text);
+        text = ext.text;
+        var fmlBitmaps = [];
+        if (ext.formulas.length) {
+            if (st0) st0.textContent = '🧮 检测到 ' + ext.formulas.length + ' 个公式，正在准备渲染…';
+            try { await xyhLoadMathJax(); } catch (e) { xyhToast('公式引擎加载失败，公式将以原文手写：' + ((e && e.message) || e), 'warning'); }
+        }
+        if (ext.formulas.length && _xyhMjEngine && _xyhMjEngine.tex2svg) {
+            var failed = [];
+            for (var _fi = 0; _fi < ext.formulas.length; _fi++) {
+                try {
+                    var bm = await xyhRasterFormula(ext.formulas[_fi], true);
+                    fmlBitmaps.push(bm);
+                    console.log('[小雅作业华为笔记导出] 公式 ' + (_fi + 1) + '/' + ext.formulas.length + ' 渲染成功');
+                } catch (e2) { failed.push(_fi); fmlBitmaps.push(null); console.log('[小雅作业华为笔记导出] 公式 ' + (_fi + 1) + ' 渲染失败（回退原文）:', (e2 && e2.message) || e2); }
+            }
+            /* 渲染失败的公式：占位符回退为 LaTeX 原文（按普通文本手写） */
+            if (failed.length) {
+                failed.forEach(function (fi) {
+                    text = text.split('\uE000' + fi).join('$' + ext.formulas[fi] + '$');
+                });
+                xyhToast(failed.length + ' 个公式渲染失败，已按原文手写', 'warning');
+            }
+        }
+        var fmlImages = ext.formulas.length ? ext.formulas.map(function (f, fi) {
+            var bm = fmlBitmaps[fi];
+            if (!bm) return null;
+            return { src: bm.dataUrl, w: bm.w, h: bm.h, bitmap: { w: bm.w, h: bm.h, data: bm.data } };
+        }) : null;
+        try {
+            var res = XYPaper.build(text, {
+                db: XY_HW_DB, ink: 0x1A1A1A,
+                raster: xyHWRaster, rasterPrinted: xyHWRasterPrinted,
+                images: fmlImages
+            });
+            if (!res || !res.strokes || !res.strokes.length) { xyhToast('生成失败：未产出笔迹', 'error'); return; }
+            var fnameEl = document.getElementById(plain ? 'xhn-text-fname' : 'xyh-md-fname');
+            var rawName = (fnameEl && fnameEl.value) || '笔记转换';
+            var title = rawName.replace(/[\/:*?"<>|]/g, '_') + '_' + xyhStamp();
+            if (fmt === 'hinote') {
+                /* [PAPER-FIX] pageColor:-1 = 白纸 0xFFFFFFFF（引擎默认深灰底导致黑底黑字） */
+                var buf = await XYHinote.writeHinote(res.strokes, { title: title, pageColor: -1 });
+                xyhSaveBlob(new Blob([buf], { type: 'application/octet-stream' }), title + '.hinote');
+                xyhToast('✅ 已导出 ' + title + '.hinote（' + res.stats.pages + ' 页）', 'success');
+            } else {
+                /* [FORMULA-FIX] 公式位图渲染为 Image，按 res.imgLayout 定位传入导出层 */
+                var imgLayout = [];
+                if (fmlImages && res.imgLayout) {
+                    for (var _pi = 0; _pi < res.imgLayout.length; _pi++) {
+                        var pl = res.imgLayout[_pi];
+                        var fim = fmlImages[pl.idx];
+                        if (!fim || !fim.src) continue;
+                        var fel = await new Promise(function (resolve) {
+                            var el = new Image();
+                            el.onload = function () { resolve(el); };
+                            el.onerror = function () { resolve(null); };
+                            el.src = fim.src;
+                        });
+                        if (fel) imgLayout.push({ page: pl.page, x: pl.x, y: pl.y, w: pl.w, h: pl.h, img: fel });
+                    }
+                }
+                if (fmt === 'pdf') {
+                    await XYExport.downloadPDF(res, res.strokes, title, 150, 0.92, imgLayout);
+                    xyhToast('✅ 已导出 PDF（' + res.stats.pages + ' 页）', 'success');
+                } else {
+                    await XYExport.downloadJPGs(res, res.strokes, title, 150, 0.92, imgLayout);
+                    xyhToast('✅ 已导出图片（' + res.stats.pages + ' 页）', 'success');
+                }
+            }
+            if (st) { st.textContent = '✅ 上次导出：' + res.stats.chars + ' 字 / ' + res.stats.pages + ' 页' + (!plain && blockCount ? ' · Markdown ' + blockCount + ' 区块' : ''); st.style.opacity = '1'; }
         } catch (e) {
             xyhToast('导出失败：' + ((e && e.message) || e), 'error');
             if (st) { st.textContent = '❌ 导出失败'; }
@@ -2716,6 +3269,12 @@ var XYExport = (function (Hinote) {  'use strict';
                 'padding:3px 6px; border-radius:7px; line-height:1;}' +
             '#xyh-panel .xyh-icon-btn:hover{background:var(--xyh-surface2); color:var(--xyh-text);}' +
             '#xyh-panel .xyh-body{padding:12px 13px; display:flex; flex-direction:column; gap:9px;}' +
+            '#xyh-panel .xyh-tabs{display:flex; gap:6px; margin-bottom:8px;}' +
+            '#xyh-panel .xyh-tab{flex:1; padding:7px 0; font-size:11.5px; font-weight:700; border-radius:8px; border:1px solid var(--xyh-border); background:transparent; color:var(--xyh-muted); cursor:pointer; transition:all .15s;}' +
+            '#xyh-panel .xyh-tab.active{border-color:#06b6d4; color:#06b6d4; background:rgba(6,182,212,0.08);}' +
+            '#xyh-panel textarea{width:100%; box-sizing:border-box; min-height:130px; resize:vertical; padding:8px 10px; font-size:11.5px; line-height:1.6; border-radius:8px; border:1px solid var(--xyh-border); background:var(--xyh-input-bg); color:var(--xyh-text); outline:none; font-family:inherit;}' +
+            '#xyh-panel textarea:focus{border-color:#a855f7; box-shadow:0 0 0 3px rgba(168,85,247,.14);}' +
+            '#xyh-panel .xyh-md-hint{font-size:10px; color:var(--xyh-muted); line-height:1.5; margin:3px 0 6px;}' +
             '#xyh-panel input{width:100%; padding:7px 10px; font-size:11.5px; border-radius:8px; border:1px solid var(--xyh-border);' +
                 'background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
             '#xyh-panel .xyh-meta{display:flex; justify-content:space-between; font-size:10px; color:var(--xyh-muted);}' +
@@ -2741,12 +3300,19 @@ var XYExport = (function (Hinote) {  'use strict';
         head.innerHTML =
             '<span aria-hidden="true">' + XYH_LOGO_SVG + '</span>' +
             '<span class="xyh-title">小雅作业华为笔记导出</span>' +
+            '<button type="button" id="xyh-upd-btn" class="xyh-icon-btn" aria-label="检查更新" title="检查更新" style="font-size:12.5px;">↻</button>' +
             '<button type="button" id="xyh-theme-toggle" class="xyh-icon-btn" aria-label="切换主题" title="切换主题"></button>' +
             '<button type="button" id="xyh-minimize" class="xyh-icon-btn" aria-label="收起面板" title="收起">—</button>';
 
         var body = document.createElement('div');
         body.className = 'xyh-body';
         body.innerHTML =
+            '<div class="xyh-tabs">' +
+                '<button class="xyh-tab active" data-xyh-tab="notes" type="button">📚 作业归档</button>' +
+                '<button class="xyh-tab" data-xyh-tab="text" type="button">📄 纯文字</button>' +
+                '<button class="xyh-tab" data-xyh-tab="md" type="button">📝 Markdown</button>' +
+            '</div>' +
+            '<div id="xyh-page-notes">' +
             '<div class="xyh-meta" style="margin-bottom:0;"><span id="xyh-count">进入作业页面自动捕获题目</span><span>A4 笔记纸 · 自动分页</span></div>' +
             '<div class="xyh-scope" style="display:flex; gap:11px; font-size:11px; color:var(--xyh-text2); margin-bottom:2px;">' +
                 '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-q" style="accent-color:#06b6d4; cursor:pointer; margin:0;" checked/>题目</label>' +
@@ -2759,7 +3325,30 @@ var XYExport = (function (Hinote) {  'use strict';
                 '<button class="xyh-btn xyh-btn-pdf" data-xhn-fmt="pdf" type="button">📄 PDF</button>' +
                 '<button class="xyh-btn xyh-btn-jpg" data-xhn-fmt="jpg" type="button">🖼 图片</button>' +
             '</div>' +
-            '<div id="xyh-status" class="xyh-status"></div>';
+            '<div id="xyh-status" class="xyh-status"></div>' +
+            '</div>' +
+            '<div id="xyh-page-text" style="display:none;">' +
+                '<textarea id="xyh-text-input" placeholder="粘贴纯文字…&#10;所见即所得：原样手写，不解析任何标记" aria-label="纯文字内容"></textarea>' +
+                '<div class="xyh-meta"><span id="xyh-text-count">0 字</span><span>A4 笔记纸 · 自动分页</span></div>' +
+                '<input id="xhn-text-fname" placeholder="文件名（默认：手写笔记）" aria-label="文件名">' +
+                '<div class="xyh-btns">' +
+                    '<button class="xyh-btn xyh-btn-hinote" data-xhn-text-fmt="hinote" type="button">📒 .hinote</button>' +
+                    '<button class="xyh-btn xyh-btn-pdf" data-xhn-text-fmt="pdf" type="button">📄 PDF</button>' +
+                    '<button class="xyh-btn xyh-btn-jpg" data-xhn-text-fmt="jpg" type="button">🖼 图片</button>' +
+                '</div>' +
+                '<div id="xyh-text-status" class="xyh-status"></div>' +
+            '</div>' +
+            '<div id="xyh-page-md" style="display:none;">' +
+            '<textarea id="xyh-md-input" placeholder="粘贴 Markdown…&#10;支持：# 标题 · - 列表 · 代码块 · > 引用 · --- 分隔线 · 公式&#10;标题与列表转结构化手写排版，公式转 MathJax 笔迹" aria-label="Markdown 内容"></textarea>' +
+            '<div class="xyh-md-hint" id="xyh-md-hint">💡 自动识别：检测到 Markdown 语法按结构化排版（■ 标题 / • 列表 / 缩进代码），否则按纯文本手写</div>' +
+            '<input id="xyh-md-fname" placeholder="文件名（默认：笔记转换）" aria-label="文件名">' +
+            '<div class="xyh-btns">' +
+                '<button class="xyh-btn xyh-btn-hinote" data-xhn-md-fmt="hinote" type="button">📒 .hinote</button>' +
+                '<button class="xyh-btn xyh-btn-pdf" data-xhn-md-fmt="pdf" type="button">📄 PDF</button>' +
+                '<button class="xyh-btn xyh-btn-jpg" data-xhn-md-fmt="jpg" type="button">🖼 图片</button>' +
+            '</div>' +
+            '<div id="xyh-md-status" class="xyh-status"></div>' +
+            '</div>';
 
         var foot = document.createElement('div');
         foot.className = 'xyh-foot';
@@ -2783,6 +3372,7 @@ var XYExport = (function (Hinote) {  'use strict';
         document.body.appendChild(panel);
 
         /* 主题切换 */
+        panel.querySelector('#xyh-upd-btn').addEventListener('click', function () { try { xyhUpdOpen(); } catch (e) {} });
         panel.querySelector('#xyh-theme-toggle').addEventListener('click', function () {
             theme = theme === 'light' ? 'dark' : 'light';
             XyhTheme.set(theme);
@@ -2811,6 +3401,30 @@ var XYExport = (function (Hinote) {  'use strict';
         /* 导出按钮 */
         panel.querySelectorAll('[data-xhn-fmt]').forEach(function (b) {
             b.addEventListener('click', function () { void exportAs(b.getAttribute('data-xhn-fmt')); });
+        });
+        /* [MD-PANEL] 面板 Tab 切换 + 文字/Markdown 导出按钮 */
+        panel.querySelectorAll('.xyh-tab').forEach(function (t) {
+            t.addEventListener('click', function () {
+                panel.querySelectorAll('.xyh-tab').forEach(function (x) { x.classList.remove('active'); });
+                t.classList.add('active');
+                var tab = t.getAttribute('data-xyh-tab');
+                var pNotes = panel.querySelector('#xyh-page-notes'), pMd = panel.querySelector('#xyh-page-md'), pText = panel.querySelector('#xyh-page-text');
+                if (pNotes) pNotes.style.display = tab === 'notes' ? '' : 'none';
+                if (pText) pText.style.display = tab === 'text' ? '' : 'none';
+                if (pMd) pMd.style.display = tab === 'md' ? '' : 'none';
+            });
+        });
+        panel.querySelectorAll('[data-xhn-md-fmt]').forEach(function (b) {
+            b.addEventListener('click', function () { void xyhExportText(b.getAttribute('data-xhn-md-fmt')); });
+            /* [SPLIT] 纯文字面板：字数统计 + 导出（plain 模式，原样手写） */
+            var taTxt = panel.querySelector('#xyh-text-input'), cntTxt = panel.querySelector('#xyh-text-count');
+            if (taTxt && cntTxt) taTxt.addEventListener('input', function () {
+                var n = taTxt.value.replace(/\s/g, '').length;
+                cntTxt.textContent = n + ' 字' + (n > 0 ? ' · 约 ' + Math.max(1, Math.ceil(n / 320)) + ' 页' : '');
+            });
+            panel.querySelectorAll('[data-xhn-text-fmt]').forEach(function (b) {
+                b.addEventListener('click', function () { void xyhExportText(b.getAttribute('data-xhn-text-fmt'), true); });
+            });
         });
         /* 作业数据：手动重拉 + 自动探测 */
         panel.querySelector('#xyh-refetch').addEventListener('click', function () {
@@ -2842,7 +3456,7 @@ var XYExport = (function (Hinote) {  'use strict';
             }
         });
         /* 笔顺库预取：后台静默加载，首次导出零等待 */
-        setTimeout(function () { xyhLoadDb().catch(function () {}); }, 1200);
+        setTimeout(function () { xyhLoadDb().catch(function () {}); xyhLoadTexMap().catch(function () {}); }, 1200);
         /* 更新提醒检查（6h 频控） */
         setTimeout(function () { try { xyhCheckUpdate(); } catch (e) {} }, 5000);
         setTimeout(xyhAutoScan, 800);
