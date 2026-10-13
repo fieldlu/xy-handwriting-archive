@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅作业华为笔记导出
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.1.0
+// @version      1.1.1
 // @description  作业题目自动转手写笔迹：打开作业页自动捕获题目，导出 .hinote（华为笔记导入）/ PDF / JPG。原「小雅辅助工具·笔记版手写导出」完整功能，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -1041,12 +1041,29 @@ var XYLayout = (function (Hinote) {  'use strict';
           var w = Math.min(im.w, contentW - 2 * pad);
           var h = w * (im.h / Math.max(1, im.w));
           if (h > bandH - 2 * pad) { h = Math.max(1, bandH - 2 * pad); w = h * (im.w / Math.max(1, im.h)); }
-          imgLayout.push({
-            idx: bi, page: pageOfRow(row),
+          var _fl = { idx: bi, page: pageOfRow(row),
             x: X0 + (contentW - w) / 2,
             y: bandTop + (bandH - h) / 2,
-            w: w, h: h
-          });
+            w: w, h: h };
+          imgLayout.push(_fl);
+          /* [FORMULA-FIX] 公式位图 → 骨架笔迹：thin + traceStrokes 后缩放平移到
+           * imgLayout 定位（与图片同位同缩放），使 .hinote（纯笔迹格式）里公式可见。 */
+          if (im.bitmap && im.bitmap.data) {
+            var ba = new Uint8Array(im.bitmap.data.length);
+            for (var bq = 0; bq < ba.length; bq++) ba[bq] = im.bitmap.data[bq] > 128 ? 1 : 0;
+            thin(ba, im.bitmap.w, im.bitmap.h);
+            var fpaths = traceStrokes(ba, im.bitmap.w, im.bitmap.h);
+            var fsx = _fl.w / im.bitmap.w, fsy = _fl.h / im.bitmap.h;
+            for (var fp = 0; fp < fpaths.length; fp++) {
+              var fpts = fpaths[fp];
+              if (!fpts || fpts.length < 2) continue;
+              var fpts2 = [];
+              for (var fq = 0; fq < fpts.length; fq++) {
+                fpts2.push([_fl.x + fpts[fq][0] * fsx, _fl.y + fpts[fq][1] * fsy, 0, 0.021]);
+              }
+              strokes.push(new Hinote.Stroke(fpts2, ink));
+            }
+          }
         }
         row += br; x = 0.0; first = true;
         continue;
@@ -2714,11 +2731,100 @@ var XYExport = (function (Hinote) {  'use strict';
         return out.join('\n');
     }
 
+    /* ================= LaTeX 公式 → 手写笔迹 =================
+     * 方案参考 GitHub 通用管线（MathJax v3 tex2svg → SVG → Image → canvas 逐像素，
+     * 见 texsvg / dsh-latex-tools）：SVG 自包含 path 无字体依赖，境内走 jsdmirror。
+     * 位图格式与 xyHWRasterPrinted 同构（透明底+白字，亮=墨迹），导出层经
+     * thin → traceStrokes 转真笔迹——.hinote（纯笔迹格式）里公式同样有效。 */
+    var XYH_MJ_URL = 'https://cdn.jsdmirror.com/npm/mathjax@3.2.2/es5/tex-svg.js';
+    var _xyhMjReady = null;
+    function xyhLoadMathJax() {
+        if (_xyhMjReady) return _xyhMjReady;
+        _xyhMjReady = new Promise(function (resolve, reject) {
+            try {
+                /* 配置必须在脚本执行前就位；fontCache='none' 让每个 SVG 自包含 path，
+                 * 否则 dataURL 化后 <use> 引用全局缓存失效，导出空白。 */
+                window.MathJax = {
+                    svg: { fontCache: 'none' },
+                    tex: { packages: { '[+]': ['ams'] } },
+                    startup: { typeset: false },
+                    options: { enableMenu: false }
+                };
+            } catch (e) { /* 环境只读时忽略 */ }
+            GM_xmlhttpRequest({
+                method: 'GET', url: XYH_MJ_URL, timeout: 60000,
+                onload: function (r) {
+                    if (r.status !== 200 || !r.responseText) { _xyhMjReady = null; reject(new Error('MathJax 加载 HTTP ' + r.status)); return; }
+                    try { (0, eval)(r.responseText); if (window.MathJax && window.MathJax.tex2svg) resolve(window.MathJax); else { _xyhMjReady = null; reject(new Error('MathJax 未就绪')); } }
+                    catch (e) { _xyhMjReady = null; reject(new Error('MathJax 执行失败: ' + (e.message || e))); }
+                },
+                onerror: function () { _xyhMjReady = null; reject(new Error('MathJax 网络错误')); },
+                ontimeout: function () { _xyhMjReady = null; reject(new Error('MathJax 加载超时')); }
+            });
+        });
+        return _xyhMjReady;
+    }
+
+    /** 提取 $..$（块级）与 $..$（行内）公式，替换为图片占位符（复用图片占行机制）。
+     * 规则：$ 后非空白且配对侧非数字，避免「价格 $5」误判。 */
+    function xyhExtractFormulas(text) {
+        var formulas = [];
+        var t = String(text || '');
+        t = t.replace(/\$\$([\s\S]+?)\$\$/g, function (m, f) {
+            formulas.push(f.trim());
+            return '\n\uE000' + (formulas.length - 1) + '\n';
+        });
+        t = t.replace(/\$(\S(?:[^$\n]*\S)?)\$/g, function (m, f) {
+            var core = f.trim();
+            if (!core) return m;
+            formulas.push(core);
+            return '\uE000' + (formulas.length - 1);
+        });
+        return { text: t, formulas: formulas };
+    }
+
+    /** 公式 → 光栅位图：tex2svg → SVG（白字，亮=墨迹）→ dataURL → Image → canvas 灰度。 */
+    function xyhRasterFormula(latex, display) {
+        return new Promise(function (resolve, reject) {
+            var svg;
+            try {
+                var node = window.MathJax.tex2svg(latex, { display: !!display });
+                svg = node.firstElementChild;
+                if (!svg || svg.tagName.toLowerCase() !== 'svg') throw new Error('tex2svg 无输出');
+                svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+                svg.style.color = '#fff';                       /* 白字 = 墨迹（亮） */
+                svg.style.background = 'transparent';
+            } catch (e) { reject(e); return; }
+            var vb = svg.viewBox && svg.viewBox.baseVal;
+            var vw = (vb && vb.width) || 300, vh = (vb && vb.height) || 100;
+            var K = 3;                                          /* 3x 超采样，细化后线条自然 */
+            var cw = Math.max(8, Math.round(vw * K)), chh = Math.max(8, Math.round(vh * K));
+            var url = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg.outerHTML)));
+            var img = new Image();
+            img.onload = function () {
+                try {
+                    var cv = document.createElement('canvas');
+                    cv.width = cw; cv.height = chh;
+                    var g = cv.getContext('2d', { willReadFrequently: true });
+                    g.clearRect(0, 0, cw, chh);                 /* 透明底 */
+                    g.drawImage(img, 0, 0, cw, chh);
+                    var d = g.getImageData(0, 0, cw, chh).data;
+                    var out = new Uint8Array(cw * chh);
+                    for (var i = 0; i < out.length; i++) out[i] = d[i * 4];
+                    resolve({ w: cw, h: chh, data: out, dataUrl: url });
+                } catch (e) { reject(e); }
+            };
+            img.onerror = function () { reject(new Error('公式 SVG 加载失败')); };
+            img.src = url;
+        });
+    }
+
     async function xyhExportText(fmt) {
         var ta = document.getElementById('xyh-md-input');
         var raw = (ta && ta.value || '').trim();
         if (!raw) { xyhToast('请先粘贴文字或 Markdown 内容', 'warning'); return; }
         try { await xyhLoadDb(); } catch (e) { xyhToast('笔顺库加载失败：' + ((e && e.message) || e), 'error'); return; }
+        var st0 = document.getElementById('xyh-md-status');
         var isMd = xyhDetectMd(raw);
         var text = raw, blockCount = 0;
         if (isMd) {
@@ -2726,14 +2832,45 @@ var XYExport = (function (Hinote) {  'use strict';
             blockCount = blocks.length;
             text = xyhBlocksToText(blocks);
         }
+        /* [FORMULA-FIX] LaTeX 公式提取（$$..$$ 与 $..$）→ 占位符；识别为公式后经
+         * MathJax 光栅化转真笔迹，.hinote（纯笔迹格式）里公式同样呈现。 */
+        var ext = xyhExtractFormulas(text);
+        text = ext.text;
+        var fmlBitmaps = [];
+        if (ext.formulas.length) {
+            if (st0) st0.textContent = '⏳ 正在渲染 ' + ext.formulas.length + ' 个公式（首次需加载公式引擎）…';
+            try { await xyhLoadMathJax(); } catch (e) { xyhToast('公式引擎加载失败，公式将以原文手写：' + ((e && e.message) || e), 'warning'); }
+        }
         var btns = document.querySelectorAll('[data-xhn-md-fmt]');
         btns.forEach(function (b) { b.disabled = true; });
         var st = document.getElementById('xyh-md-status');
         if (st) { st.textContent = '⏳ 正在生成' + (fmt === 'hinote' ? ' .hinote' : fmt === 'pdf' ? ' PDF' : ' 图片') + '…'; st.style.opacity = '1'; }
+        if (ext.formulas.length && window.MathJax && window.MathJax.tex2svg) {
+            var failed = [];
+            for (var _fi = 0; _fi < ext.formulas.length; _fi++) {
+                try {
+                    var bm = await xyhRasterFormula(ext.formulas[_fi], true);
+                    fmlBitmaps.push(bm);
+                } catch (e2) { failed.push(_fi); fmlBitmaps.push(null); }
+            }
+            /* 渲染失败的公式：占位符回退为 LaTeX 原文（按普通文本手写） */
+            if (failed.length) {
+                failed.forEach(function (fi) {
+                    text = text.split('\uE000' + fi).join('$' + ext.formulas[fi] + '$');
+                });
+                xyhToast(failed.length + ' 个公式渲染失败，已按原文手写', 'warning');
+            }
+        }
+        var fmlImages = ext.formulas.length ? ext.formulas.map(function (f, fi) {
+            var bm = fmlBitmaps[fi];
+            if (!bm) return null;
+            return { src: bm.dataUrl, w: bm.w, h: bm.h, bitmap: { w: bm.w, h: bm.h, data: bm.data } };
+        }) : null;
         try {
             var res = XYPaper.build(text, {
                 db: XY_HW_DB, ink: 0x1A1A1A,
-                raster: xyHWRaster, rasterPrinted: xyHWRasterPrinted
+                raster: xyHWRaster, rasterPrinted: xyHWRasterPrinted,
+                images: fmlImages
             });
             if (!res || !res.strokes || !res.strokes.length) { xyhToast('生成失败：未产出笔迹', 'error'); return; }
             var rawName = (document.getElementById('xyh-md-fname') && document.getElementById('xyh-md-fname').value) || '笔记转换';
