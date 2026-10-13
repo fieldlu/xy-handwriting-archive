@@ -1,9 +1,8 @@
 {
-  "version": "1.1.0",
-  "updatedAt": "2026-10-13",
+  "version": "1.0.1",
+  "updatedAt": "2026-10-12",
   "installUrl": "https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js",
   "notes": [
-    "📝 新增文字 / Markdown 转手写：双面板界面，支持 # 标题/列表/代码块/引用结构化排版，自动识别格式",
     "🚀 自动获取作业题目：打开作业页自动捕获，免粘贴直接导出",
     "📡 实时请求劫持：fetch + XHR 双通道，打开页面瞬间捕获",
     "✅ 内容范围勾选：题目 / 标准答案 / 我的作答自由组合",
