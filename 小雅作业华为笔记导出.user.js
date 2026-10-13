@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅作业华为笔记导出
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.1
+// @version      1.1.0
 // @description  作业题目自动转手写笔迹：打开作业页自动捕获题目，导出 .hinote（华为笔记导入）/ PDF / JPG。原「小雅辅助工具·笔记版手写导出」完整功能，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -2639,6 +2639,125 @@ var XYExport = (function (Hinote) {  'use strict';
         }
     }
 
+    /* ================= 文字 / Markdown → 手写 =================
+     * 借鉴：matt-bat/programmatic-text-to-handwriting（MD → 块解析 → 逐块渲染·确定性种子）、
+     * RustyPiano/Markdown2Handwrite（块解析先行再渲染）、本地 remark-docx fork（块类型集合）。
+     * 三段式：MD 块解析 → 块到排版文本映射（■ 标题/• 列表/缩进代码/引用前缀）→ 交给
+     * XYPaper.build 现有手写引擎，引擎零改动。 */
+    function xyhMdInline(t) {
+        return String(t || '')
+            .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+            .replace(/\*\*([^*]+)\*\*/g, '$1')
+            .replace(/__([^_]+)__/g, '$1')
+            .replace(/\*([^*]+)\*/g, '$1')
+            .replace(/~~([^~]+)~~/g, '$1')
+            .replace(/`([^`]+)`/g, '$1');
+    }
+
+    function xyhMdParse(md) {
+        var rows = String(md || '').replace(/\r\n/g, '\n').split('\n');
+        var blocks = [], inCode = false, codeBuf = [];
+        var listRe = /^(\s*)([-*+]|\d+[.、)])\s+(.*)$/;
+        for (var i = 0; i < rows.length; i++) {
+            var ln = rows[i];
+            if (/^```/.test(ln.trim())) {
+                if (!inCode) { inCode = true; codeBuf = []; }
+                else { blocks.push({ t: 'code', text: codeBuf.join('\n') }); inCode = false; }
+                continue;
+            }
+            if (inCode) { codeBuf.push(ln); continue; }
+            var t = ln.trim();
+            if (!t) continue;
+            var h = t.match(/^(#{1,6})\s+(.*)$/);
+            if (h) { blocks.push({ t: 'h', level: Math.min(h[1].length, 3), text: xyhMdInline(h[2]) }); continue; }
+            if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) { blocks.push({ t: 'hr' }); continue; }
+            var q = t.match(/^>\s?(.*)$/);
+            if (q) { blocks.push({ t: 'quote', text: xyhMdInline(q[1]) }); continue; }
+            var li = ln.match(listRe);
+            if (li) {
+                var depth = Math.floor(li[1].replace(/\t/g, '  ').length / 2);
+                var ordered = /\d/.test(li[2]);
+                blocks.push({ t: 'li', depth: Math.min(depth, 2), mark: ordered ? li[2] : '•', text: xyhMdInline(li[3]) });
+                continue;
+            }
+            blocks.push({ t: 'p', text: xyhMdInline(t) });
+        }
+        if (inCode && codeBuf.length) blocks.push({ t: 'code', text: codeBuf.join('\n') });
+        return blocks;
+    }
+
+    function xyhDetectMd(text) {
+        if (!text) return false;
+        var n = 0;
+        String(text).split('\n').forEach(function (l) {
+            if (/^#{1,6}\s/.test(l) || /^```/.test(l) || /^[-*+]\s/.test(l) || /^\d+[.、)]\s/.test(l) || /^>\s/.test(l)) n++;
+        });
+        return n >= 1;
+    }
+
+    function xyhBlocksToText(blocks) {
+        var out = [];
+        blocks.forEach(function (b) {
+            var pad = b.depth ? new Array(b.depth + 1).join('　') : '';
+            if (b.t === 'h') out.push((b.level === 1 ? '■ ' : b.level === 2 ? '◆ ' : '· ') + b.text);
+            else if (b.t === 'li') out.push(pad + b.mark + ' ' + b.text);
+            else if (b.t === 'code') {
+                out.push('── 代码 ──');
+                b.text.split('\n').forEach(function (cl) { out.push('　' + cl); });
+                out.push('────────');
+            }
+            else if (b.t === 'quote') out.push('> ' + b.text);
+            else if (b.t === 'hr') out.push('────────────');
+            else out.push(b.text);
+        });
+        return out.join('\n');
+    }
+
+    async function xyhExportText(fmt) {
+        var ta = document.getElementById('xyh-md-input');
+        var raw = (ta && ta.value || '').trim();
+        if (!raw) { xyhToast('请先粘贴文字或 Markdown 内容', 'warning'); return; }
+        try { await xyhLoadDb(); } catch (e) { xyhToast('笔顺库加载失败：' + ((e && e.message) || e), 'error'); return; }
+        var isMd = xyhDetectMd(raw);
+        var text = raw, blockCount = 0;
+        if (isMd) {
+            var blocks = xyhMdParse(raw);
+            blockCount = blocks.length;
+            text = xyhBlocksToText(blocks);
+        }
+        var btns = document.querySelectorAll('[data-xhn-md-fmt]');
+        btns.forEach(function (b) { b.disabled = true; });
+        var st = document.getElementById('xyh-md-status');
+        if (st) { st.textContent = '⏳ 正在生成' + (fmt === 'hinote' ? ' .hinote' : fmt === 'pdf' ? ' PDF' : ' 图片') + '…'; st.style.opacity = '1'; }
+        try {
+            var res = XYPaper.build(text, {
+                db: XY_HW_DB, ink: 0x1A1A1A,
+                raster: xyHWRaster, rasterPrinted: xyHWRasterPrinted
+            });
+            if (!res || !res.strokes || !res.strokes.length) { xyhToast('生成失败：未产出笔迹', 'error'); return; }
+            var rawName = (document.getElementById('xyh-md-fname') && document.getElementById('xyh-md-fname').value) || '笔记转换';
+            var title = rawName.replace(/[\/:*?"<>|]/g, '_') + '_' + xyhStamp();
+            if (fmt === 'hinote') {
+                var buf = await XYHinote.writeHinote(res.strokes, { title: title });
+                xyhSaveBlob(new Blob([buf], { type: 'application/octet-stream' }), title + '.hinote');
+                xyhToast('✅ 已导出 ' + title + '.hinote（' + res.stats.pages + ' 页）', 'success');
+            } else if (fmt === 'pdf') {
+                await XYExport.downloadPDF(res, res.strokes, title, 150, 0.92, []);
+                xyhToast('✅ 已导出 PDF（' + res.stats.pages + ' 页）', 'success');
+            } else {
+                await XYExport.downloadJPGs(res, res.strokes, title, 150, 0.92, []);
+                xyhToast('✅ 已导出图片（' + res.stats.pages + ' 页）', 'success');
+            }
+            if (st) { st.textContent = '✅ 上次导出：' + res.stats.chars + ' 字 / ' + res.stats.pages + ' 页' + (isMd ? ' · Markdown ' + blockCount + ' 区块' : ''); st.style.opacity = '1'; }
+        } catch (e) {
+            xyhToast('导出失败：' + ((e && e.message) || e), 'error');
+            if (st) { st.textContent = '❌ 导出失败'; }
+        } finally {
+            btns.forEach(function (b) { b.disabled = false; });
+        }
+    }
+
     function xyhMakeDraggable(handle, target, posKey) {
         handle.style.cursor = 'move';
         handle.addEventListener('pointerdown', function (ev) {
@@ -2716,6 +2835,12 @@ var XYExport = (function (Hinote) {  'use strict';
                 'padding:3px 6px; border-radius:7px; line-height:1;}' +
             '#xyh-panel .xyh-icon-btn:hover{background:var(--xyh-surface2); color:var(--xyh-text);}' +
             '#xyh-panel .xyh-body{padding:12px 13px; display:flex; flex-direction:column; gap:9px;}' +
+            '#xyh-panel .xyh-tabs{display:flex; gap:6px; margin-bottom:8px;}' +
+            '#xyh-panel .xyh-tab{flex:1; padding:7px 0; font-size:11.5px; font-weight:700; border-radius:8px; border:1px solid var(--xyh-border); background:transparent; color:var(--xyh-muted); cursor:pointer; transition:all .15s;}' +
+            '#xyh-panel .xyh-tab.active{border-color:#06b6d4; color:#06b6d4; background:rgba(6,182,212,0.08);}' +
+            '#xyh-panel textarea{width:100%; box-sizing:border-box; min-height:130px; resize:vertical; padding:8px 10px; font-size:11.5px; line-height:1.6; border-radius:8px; border:1px solid var(--xyh-border); background:var(--xyh-input-bg); color:var(--xyh-text); outline:none; font-family:inherit;}' +
+            '#xyh-panel textarea:focus{border-color:#a855f7; box-shadow:0 0 0 3px rgba(168,85,247,.14);}' +
+            '#xyh-panel .xyh-md-hint{font-size:10px; color:var(--xyh-muted); line-height:1.5; margin:3px 0 6px;}' +
             '#xyh-panel input{width:100%; padding:7px 10px; font-size:11.5px; border-radius:8px; border:1px solid var(--xyh-border);' +
                 'background:var(--xyh-input-bg); color:var(--xyh-text); outline:none;}' +
             '#xyh-panel .xyh-meta{display:flex; justify-content:space-between; font-size:10px; color:var(--xyh-muted);}' +
@@ -2747,6 +2872,11 @@ var XYExport = (function (Hinote) {  'use strict';
         var body = document.createElement('div');
         body.className = 'xyh-body';
         body.innerHTML =
+            '<div class="xyh-tabs">' +
+                '<button class="xyh-tab active" data-xyh-tab="notes" type="button">📚 作业归档</button>' +
+                '<button class="xyh-tab" data-xyh-tab="md" type="button">📝 文字 / Markdown</button>' +
+            '</div>' +
+            '<div id="xyh-page-notes">' +
             '<div class="xyh-meta" style="margin-bottom:0;"><span id="xyh-count">进入作业页面自动捕获题目</span><span>A4 笔记纸 · 自动分页</span></div>' +
             '<div class="xyh-scope" style="display:flex; gap:11px; font-size:11px; color:var(--xyh-text2); margin-bottom:2px;">' +
                 '<label style="display:inline-flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" id="xyh-scope-q" style="accent-color:#06b6d4; cursor:pointer; margin:0;" checked/>题目</label>' +
@@ -2759,7 +2889,19 @@ var XYExport = (function (Hinote) {  'use strict';
                 '<button class="xyh-btn xyh-btn-pdf" data-xhn-fmt="pdf" type="button">📄 PDF</button>' +
                 '<button class="xyh-btn xyh-btn-jpg" data-xhn-fmt="jpg" type="button">🖼 图片</button>' +
             '</div>' +
-            '<div id="xyh-status" class="xyh-status"></div>';
+            '<div id="xyh-status" class="xyh-status"></div>' +
+            '</div>' +
+            '<div id="xyh-page-md" style="display:none;">' +
+            '<textarea id="xyh-md-input" placeholder="粘贴文字或 Markdown…&#10;支持：# 标题 · - 列表 · 代码块 · > 引用 · --- 分隔线&#10;自动识别格式，标题与列表转结构化手写排版" aria-label="文字或 Markdown 内容"></textarea>' +
+            '<div class="xyh-md-hint" id="xyh-md-hint">💡 自动识别：检测到 Markdown 语法按结构化排版（■ 标题 / • 列表 / 缩进代码），否则按纯文本手写</div>' +
+            '<input id="xyh-md-fname" placeholder="文件名（默认：笔记转换）" aria-label="文件名">' +
+            '<div class="xyh-btns">' +
+                '<button class="xyh-btn xyh-btn-hinote" data-xhn-md-fmt="hinote" type="button">📒 .hinote</button>' +
+                '<button class="xyh-btn xyh-btn-pdf" data-xhn-md-fmt="pdf" type="button">📄 PDF</button>' +
+                '<button class="xyh-btn xyh-btn-jpg" data-xhn-md-fmt="jpg" type="button">🖼 图片</button>' +
+            '</div>' +
+            '<div id="xyh-md-status" class="xyh-status"></div>' +
+            '</div>';
 
         var foot = document.createElement('div');
         foot.className = 'xyh-foot';
@@ -2811,6 +2953,20 @@ var XYExport = (function (Hinote) {  'use strict';
         /* 导出按钮 */
         panel.querySelectorAll('[data-xhn-fmt]').forEach(function (b) {
             b.addEventListener('click', function () { void exportAs(b.getAttribute('data-xhn-fmt')); });
+        });
+        /* [MD-PANEL] 面板 Tab 切换 + 文字/Markdown 导出按钮 */
+        panel.querySelectorAll('.xyh-tab').forEach(function (t) {
+            t.addEventListener('click', function () {
+                panel.querySelectorAll('.xyh-tab').forEach(function (x) { x.classList.remove('active'); });
+                t.classList.add('active');
+                var isMd = t.getAttribute('data-xyh-tab') === 'md';
+                var pNotes = panel.querySelector('#xyh-page-notes'), pMd = panel.querySelector('#xyh-page-md');
+                if (pNotes) pNotes.style.display = isMd ? 'none' : '';
+                if (pMd) pMd.style.display = isMd ? '' : 'none';
+            });
+        });
+        panel.querySelectorAll('[data-xhn-md-fmt]').forEach(function (b) {
+            b.addEventListener('click', function () { void xyhExportText(b.getAttribute('data-xhn-md-fmt')); });
         });
         /* 作业数据：手动重拉 + 自动探测 */
         panel.querySelector('#xyh-refetch').addEventListener('click', function () {
