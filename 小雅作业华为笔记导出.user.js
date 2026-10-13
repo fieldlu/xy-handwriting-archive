@@ -1291,7 +1291,8 @@ var XYPaper = (function (Hinote, Layout) {  'use strict';
     var strokes = [], p;
     for (p = 0; p < pages; p++) {
       strokes = strokes.concat(frame(p, o));
-      strokes = strokes.concat(ruled(p, p === 0 ? o.c0 : o.c1, o));
+      /* [HINOTE-FIX] noRule：hinote 不要虚线横格线（白纸纯笔迹）；PDF/JPG 保留纸感 */
+      if (!o.noRule) strokes = strokes.concat(ruled(p, p === 0 ? o.c0 : o.c1, o));
       strokes = strokes.concat(pageNum(p, o));
     }
     strokes = strokes.concat(body.strokes);
@@ -1595,7 +1596,7 @@ var XYExport = (function (Hinote) {  'use strict';
     /* ---------- 应用内「检查更新」按钮 + 弹窗（交互对齐小雅辅助工具） ----------
      * 手动检查绕过 6h 频控；清单含 installUrl（新版一键跳安装页）与 notes 更新日志。 */
     var XYH_LATEST_URL = 'https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/hw-script.latest.json';
-    var XYH_INSTALL_URL = 'https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js';
+    var XYH_INSTALL_URL = 'https://scriptcat.org/scripts/code/8408/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js';
     var _xyhUpdState = { checking: false, info: null, error: '' };
     var _xyhUpdModal = null;
     function xyhCurVer() { return (typeof GM_info !== 'undefined' && GM_info.script) ? GM_info.script.version : ''; }
@@ -2679,7 +2680,7 @@ var XYExport = (function (Hinote) {  'use strict';
             try { localStorage.setItem(this.KEY, JSON.stringify(scope)); } catch (e) {}
         }
     };
-    console.log('[小雅作业华为笔记导出] 引擎加载完成 v1.0.1');
+    console.log('[小雅作业华为笔记导出] 引擎加载完成 v1.0.2');
 
     // 调试句柄：控制台可用 XyHandwriting.* 手动调用引擎各模块
     try { globalThis.XyHandwriting = { XYPaper: XYPaper, XYHinote: XYHinote, XYExport: XYExport, get XY_HW_DB() { return XY_HW_DB; }, xyHWRaster: xyHWRaster, xyHWRasterPrinted: xyHWRasterPrinted }; } catch (e) {}
@@ -2778,7 +2779,8 @@ var XYExport = (function (Hinote) {  'use strict';
             var res = XYPaper.build(text, {
                 db: XY_HW_DB, ink: 0x1A1A1A,
                 raster: xyHWRaster, rasterPrinted: xyHWRasterPrinted,
-                images: autoImages
+                images: autoImages,
+                noRule: fmt === 'hinote' /* hinote 白纸无虚线横格 */
             });
             if (!res || !res.strokes || !res.strokes.length) { xyhToast('生成失败：未产出笔迹', 'error'); return; }
             var rawName = (document.getElementById('xhn-fname') && document.getElementById('xhn-fname').value) || '手写归档';
@@ -3147,7 +3149,8 @@ var XYExport = (function (Hinote) {  'use strict';
             var res = XYPaper.build(text, {
                 db: XY_HW_DB, ink: 0x1A1A1A,
                 raster: xyHWRaster, rasterPrinted: xyHWRasterPrinted,
-                images: fmlImages
+                images: fmlImages,
+                noRule: fmt === 'hinote' /* hinote 白纸无虚线横格 */
             });
             if (!res || !res.strokes || !res.strokes.length) { xyhToast('生成失败：未产出笔迹', 'error'); return; }
             var fnameEl = document.getElementById(plain ? 'xhn-text-fname' : 'xyh-md-fname');

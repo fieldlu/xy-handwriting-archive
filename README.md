@@ -27,7 +27,7 @@
 ## 安装
 
 1. 安装 Tampermonkey 浏览器扩展（或脚本猫）
-2. [点击安装小雅作业华为笔记导出](https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js)
+2. [点击安装小雅作业华为笔记导出（ScriptCat 脚本站）](https://scriptcat.org/scripts/code/8408/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js)（备选：[Gitee raw 直装](https://gitee.com/fieldlu/xy-handwriting-archive/raw/main/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js)）
 3. 打开小雅平台（whut.ai-augmented.com），页面右下角出现「✍️ 手写」悬浮按钮
 4. 进入作业/试卷页面，脚本自动捕获题目（面板顶部状态条显示「已捕获 N 题」）
 
@@ -73,7 +73,8 @@
   - **数学公式手写体化**：`$..$` / `$$..$$` 公式 LaTeX→Unicode 线性化（希腊字母 θ、积分 ∫、根号 √、上下标 ²ᵢ、分式 (a)/(b)），与正文统一手写笔迹，不再生成排版图片；映射表外置 xy-hw-tex.json，脚本本体不内嵌
   - **MD 排版归一**：标题/代码/引用/分割线前后自动空行，块级公式独立成行不与正文粘连，连续空行压一
   - **检查更新按钮**：面板头部「↻」手动检查（双版本对照 + 更新日志 + 一键前往安装页），自动检查保持 6 小时频控
-  - **修复纸张颜色**：hinote 全页面统一白纸（此前非主页页面可能呈深灰底）
+  - **修复纸张颜色**：hinote 全页面统一白纸（此前非主页页面可能呈深灰底）；hinote 移除页面虚线横格线，白纸纯笔迹（PDF/图片保留纸感横线）
+  - **检查更新**：安装页指向 ScriptCat 脚本站
 - **1.0.1**（2026-10-12）：完整功能版，主要更新：
   - **实时请求劫持**：fetch + XHR 双通道，document-start 先于页面脚本安装——打开页面瞬间捕获题目，不再依赖主动拉取（主动拉取保留为兜底）
   - **自动获取作业题目**：打开作业/试卷页面自动捕获题目与标准答案，免粘贴直接导出（数据链路与主工具同源）
