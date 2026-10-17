@@ -2,6 +2,8 @@
 
 > **打开作业页面，题目自动变手写。** 自动捕获作业题目与标准答案，一键生成笔顺级仿真手写笔记，导出 **.hinote（导入华为平板继续写）/ PDF / JPG**。
 
+GitHub 镜像：[fieldlu/xy-handwriting-archive](https://github.com/fieldlu/xy-handwriting-archive)（主仓库 Gitee，两处同步更新）
+
 本脚本是原「小雅辅助工具 · 笔记版手写导出」功能的完整独立版（自 v3.7.4.5 拆分），不依赖小雅辅助工具，可单独安装使用。
 
 ---
