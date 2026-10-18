@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小雅作业华为笔记导出
 // @namespace    https://gitee.com/fieldlu/xy-handwriting-archive
-// @version      1.0.2
+// @version      1.0.3
 // @description  作业题目自动转手写笔迹：打开作业页自动捕获题目，导出 .hinote（华为笔记导入）/ PDF / JPG。原「小雅辅助工具·笔记版手写导出」完整功能，可独立运行
 // @author       Confidential
 // @license      GPL-3.0-or-later
@@ -2852,6 +2852,22 @@ var XYExport = (function (Hinote) {  'use strict';
             var h = t.match(/^(#{1,6})\s+(.*)$/);
             if (h) { blocks.push({ t: 'h', level: Math.min(h[1].length, 3), text: xyhMdInline(h[2]) }); continue; }
             if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) { blocks.push({ t: 'hr' }); continue; }
+            /* [MD-TABLE] 管道表格：连续 | … | 行合并为一个 table 块，
+             * 跳过分隔行（|---|:--:|），单元格走行内清洗（保留 $公式$ 待后续线性化） */
+            if (/^\|/.test(t)) {
+                var trows = [];
+                while (i < rows.length && /^\|/.test(rows[i].trim())) {
+                    var raw = rows[i].trim();
+                    if (!/^\|[\s:|-]+\|?$/.test(raw)) {
+                        var cells = raw.replace(/^\|/, '').replace(/\|$/, '').split('|');
+                        trows.push(cells.map(function (c) { return xyhMdInline(c.trim()); }));
+                    }
+                    i++;
+                }
+                i--;
+                if (trows.length) blocks.push({ t: 'table', rows: trows });
+                continue;
+            }
             var q = t.match(/^>\s?(.*)$/);
             if (q) { blocks.push({ t: 'quote', text: xyhMdInline(q[1]) }); continue; }
             var li = ln.match(listRe);
@@ -2877,7 +2893,7 @@ var XYExport = (function (Hinote) {  'use strict';
             if (/^#{1,6}\s/.test(l) || /^```/.test(l) || /^[-*+]\s/.test(l) || /^\d+[.、)]\s/.test(l) || /^>\s/.test(l)) n++;
             /* 行内标记（粗体/删除线）与无空格星号列表同样算 MD 特征——
              * 修「纯段落带 **粗体** 却走纯文本路径遗留星号」问题 */
-            else if (/\*\*[^*]+\*\*/.test(l) || /~~[^~]+~~/.test(l) || /^\*[^*\s]/.test(l)) n++;
+            else if (/\*\*[^*]+\*\*/.test(l) || /~~[^~]+~~/.test(l) || /^\*[^*\s]/.test(l) || /^\|.*\|\s*$/.test(l)) n++;
         });
         return n >= 1;
     }
@@ -2898,6 +2914,16 @@ var XYExport = (function (Hinote) {  'use strict';
                 out.push('── 代码 ──');
                 b.text.split('\n').forEach(function (cl) { out.push('　' + cl); });
                 out.push('────────');
+                out.push('');
+            }
+            else if (b.t === 'table') {
+                var ncol = b.rows[0] ? b.rows[0].length : 1;
+                var rule = '';
+                for (var ci = 0; ci < Math.min(ncol * 4, 24); ci++) rule += '─';
+                b.rows.forEach(function (cells, ri) {
+                    out.push(cells.join(' ｜ '));
+                    if (ri === 0) out.push(rule);
+                });
                 out.push('');
             }
             else if (b.t === 'quote') out.push('▍ ' + b.text);
@@ -2965,8 +2991,6 @@ var XYExport = (function (Hinote) {  'use strict';
      * 手写笔记场景下分式写 a/b、上标写 ² 完全符合真实书写习惯。 */
     function xyhTexToLinear(tex) {
         var t = String(tex || '');
-        /* 映射表外置（xy-hw-tex.json）：希腊字母 / 运算符 / 上下标均不内嵌脚本。
-         * 未加载成功时仅保留结构命令兜底，公式结构转换（分式/根号/上下标剥除）不受影响。 */
         var MAP = _XY_HW_TEX || {};
         var greek = MAP.greek || {};
         var ops = {}, _k;
@@ -2974,57 +2998,148 @@ var XYExport = (function (Hinote) {  'use strict';
         for (_k in (MAP.ops || {})) ops[_k] = MAP.ops[_k];
         var sup = MAP.sup || {};
         var sub = MAP.sub || {};
-        Object.keys(greek).forEach(function (k) { t = t.split('\\' + k).join(greek[k]); });
-        /* 运算符：命令长度降序替换，防 \le 抢配 \leq */
-        Object.keys(ops).sort(function (a, b) { return b.length - a.length; }).forEach(function (k) { t = t.split('\\' + k).join(ops[k]); });
-        /* 数学函数名保留原文（cos/sin/tan/lim/log/ln/max/min/exp） */
-        /* 上下标 → Unicode 上/下标（常见单字符与数字）；无对应时保留 ^ x 原样 */
-        function supSub(re, table) {
-            t = t.replace(re, function (m, body) {
-                body = body.trim();
-                /* 整段可映射则全转，否则保留原记法 */
-                var ok = true, mapped = '';
-                for (var q = 0; q < body.length; q++) {
-                    var ch = body[q];
-                    if (table[ch]) mapped += table[ch];
-                    else if (ch === ' ') { mapped += ''; }
-                    else { ok = false; break; }
-                }
-                return ok ? mapped : m;
-            });
+
+        /* ---- 0) 环境类：矩阵 / 分段函数（必须先做，否则花括号和 & \\ 会先被拆散） ---- */
+        function _rows(body) {
+            return String(body)
+                .replace(/\\hline/g, '')
+                .replace(/\\cline\{[^{}]*\}/g, '')
+                .split(/\\\\/)
+                .map(function (r) { return r.replace(/\s*&\s*/g, ' ').trim(); })
+                .filter(function (r) { return r !== ''; });
         }
-        supSub(/\^\{([^{}]*)\}/g, sup);
-        supSub(/\^(\S)/g, sup);
-        supSub(/_\{([^{}]*)\}/g, sub);
-        supSub(/_(\S)/g, sub);
-        /* 分式 → (分子)/(分母)：反复处理最内层（嵌套 \frac 由内向外） */
-        var guard = 0;
-        while (t.indexOf('\\frac') !== -1 && guard++ < 20) {
-            t = t.replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, function (m, a, b) {
-                return '(' + a.trim() + ')/(' + b.trim() + ')';
+        t = t.replace(/\\begin\{(bmatrix|pmatrix|Bmatrix|vmatrix|Vmatrix|matrix|smallmatrix|array)\}\s*(\{[^{}]*\})?([\s\S]*?)\\end\{\1\}/g,
+            function (m, env, colspec, body) {
+                var open = '', close = '';
+                if (env === 'pmatrix') { open = '('; close = ')'; }
+                else if (env === 'bmatrix') { open = '['; close = ']'; }
+                else if (env === 'vmatrix' || env === 'Vmatrix') { open = '|'; close = '|'; }
+                else if (env === 'Bmatrix') { open = '{'; close = '}'; }
+                return open + _rows(body).join(' ; ') + close;
             });
+        t = t.replace(/\\begin\{(cases|dcases)\}([\s\S]*?)\\end\{\1\}/g,
+            function (m, env, body) { return '{' + _rows(body).join(' ; ') + '}'; });
+        t = t.replace(/\\begin\{(aligned|align\*?|gathered|split|eqnarray\*?)\}([\s\S]*?)\\end\{\1\}/g,
+            function (m, env, body) { return _rows(body).join(' ; '); });
+
+        /* ---- 1) 定界符归一：绝对值 / 范数 ----
+         * \left \right \middle 先整体剥离；\lvert→|、\| 与 \lVert→‖（双竖线表示范数） */
+        t = t.replace(/\\(?:left|right|middle)\b\s*/g, '');
+        t = t.replace(/\\[lr]?[vV]ert\b|\\(?:lVert|rVert)\b/gi, '|');
+        t = t.replace(/\\\|/g, '‖');
+        t = t.replace(/\\mid\b/gi, '|');
+
+        /* ---- 2) 修饰类命令：盒子 / 颜色 / 无花括号的字体命令 ---- */
+        t = t.replace(/\\textcolor\s*\{[^{}]*\}\s*\{([^{}]*)\}/g, '$1');
+        t = t.replace(/\\(?:boxed|fbox)\s*\{([^{}]*)\}/g, function (m, x) { return '\u3010' + x.trim() + '\u3011'; });
+        /* \mathsf T / \mathrm d 这类「命令 + 单 token」，在结构解析前先吃掉，避免残成 "mathsf T" */
+        t = t.replace(/\\(?:text|textrm|textbf|textit|mathrm|mathbf|mathit|mathsf|mathtt|operatorname)\s+([A-Za-z0-9])/g, '$1');
+
+        /* ---- 3) 角度与特殊上标（须在 \circ 被映射成 ∘ 之前） ---- */
+        t = t.replace(/\^\s*\{?\s*\\circ\s*\}?/g, '°');
+        t = t.replace(/\^\s*\{?\s*\\prime\s*\}?/g, '′');
+
+        /* ---- 4) 希腊字母 / 运算符（命令长度降序，防 \le 抢配 \leq） ---- */
+        var opKeys = Object.keys(ops).sort(function (a, b) { return b.length - a.length; });
+        var _opMap = {};
+        opKeys.forEach(function (k) { _opMap[k] = ops[k]; });
+        t = t.replace(/\\([a-zA-Z]+)/g, function (m, name) {
+            if (Object.prototype.hasOwnProperty.call(_opMap, name)) return _opMap[name];
+            if (Object.prototype.hasOwnProperty.call(greek, name)) return greek[name];
+            return m;
+        });
+
+        /* ---- 5) 结构解析：根号 / 分式 / 文本 / 上下标 ----
+         * 只匹配「花括号内无嵌套」的最内层，反复迭代由内向外收敛，
+         * 解决 \frac{\sqrt{2}}{2} 这类嵌套匹配失败后残留 "frac" 的问题。 */
+        function _mapAll(s2, table) {
+            var out = '';
+            for (var q = 0; q < s2.length; q++) {
+                var ch = s2.charAt(q);
+                if (!Object.prototype.hasOwnProperty.call(table, ch)) return null;
+                out += table[ch];
+            }
+            return out;
         }
-        /* 根号：\sqrt{x} → √(x)；\sqrt[n]{x} → ⁿ√(x) */
-        t = t.replace(/\\sqrt\s*\[([^\]]*)\]\s*\{([^{}]*)\}/g, function (m, n, x) { return (sup[n] || '^(' + n + ')') + '√(' + x.trim() + ')'; });
-        t = t.replace(/\\sqrt\s*\{([^{}]*)\}/g, function (m, x) { return '√(' + x.trim() + ')'; });
-        /* 定界符与修饰清理 */
-        t = t.replace(/\\left\s*\\\{/g, '{').replace(/\\right\s*\\\}/g, '}');
-        t = t.replace(/\\left\s*\[/g, '[').replace(/\\right\s*\]/g, ']');
-        t = t.replace(/\\left\s*\|/g, '|').replace(/\\right\s*\|/g, '|');
-        t = t.replace(/\\left\s*\./g, '').replace(/\\right\s*\./g, '');
-        t = t.replace(/\\(text|mathrm|mathbf|mathit)\s*\{([^{}]*)\}/g, '$2');
-        t = t.replace(/\\(,|;|:|!)/g, ' ');
+        function _linearBody(x) { return String(x == null ? '' : x).trim(); }
+        /* 只在「顶层」出现二元运算符/空格时才加括号：
+         * |x-1| 的减号在竖线内、√(x²+1) 的加号在圆括号内，都不该再套一层。 */
+        function _needParen(v) {
+            if (v.length <= 1) return false;
+            var depth = 0, inBar = false;
+            for (var q = 0; q < v.length; q++) {
+                var c = v.charAt(q);
+                if (c === '|' || c === '‖') { inBar = !inBar; continue; }
+                if (inBar) continue;
+                if (c === '(' || c === '[') { depth++; continue; }
+                if (c === ')' || c === ']') { if (depth > 0) depth--; continue; }
+                if (depth === 0 && /[+\-=<>×÷·\/\s]/.test(c)) return true;
+            }
+            return false;
+        }
+        function _wrap(x) {
+            var v = _linearBody(x);
+            if (!v) return '';
+            return _needParen(v) ? '(' + v + ')' : v;
+        }
+
+        var guard = 0, prev = null;
+        do {
+            prev = t;
+            /* 根号：\sqrt[n]{x} → ⁿ√x；\sqrt{x} → √x；\sqrt5 → √5 */
+            t = t.replace(/\\sqrt\s*\[([^\[\]{}]*)\]\s*\{([^{}]*)\}/g, function (m, n, x) {
+                var idx = _mapAll(_linearBody(n), sup);
+                return (idx === null ? '[' + _linearBody(n) + ']' : idx) + '√' + _wrap(x);
+            });
+            t = t.replace(/\\sqrt\s*\{([^{}]*)\}/g, function (m, x) { return '√' + _wrap(x); });
+            t = t.replace(/\\sqrt\s*([A-Za-z0-9])/g, function (m, c) { return '√' + c; });
+            /* 分式：\frac{a}{b} → a/b，按需加括号；\frac12 这种简写也支持 */
+            t = t.replace(/\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, function (m, a, b) {
+                return _wrap(a) + '/' + _wrap(b);
+            });
+            t = t.replace(/\\[dt]?frac\s+?([A-Za-z0-9])\s*([A-Za-z0-9])/g, function (m, a, b) {
+                return a + '/' + b;
+            });
+            /* 文本类命令直接取内容 */
+            t = t.replace(/\\(?:text|textrm|textbf|textit|mathrm|mathbf|mathit|mathsf|mathtt|operatorname)\s*\{([^{}]*)\}/g, function (m, x) { return x; });
+            /* 修饰符 */
+            t = t.replace(/\\overline\s*\{([^{}]*)\}/g, function (m, x) { return _wrap(x) + '\u0305'; });
+            t = t.replace(/\\bar\s*\{([^{}]*)\}/g, function (m, x) { return _wrap(x) + '\u0304'; });
+            t = t.replace(/\\hat\s*\{([^{}]*)\}/g, function (m, x) { return _wrap(x) + '\u0302'; });
+            t = t.replace(/\\vec\s*\{([^{}]*)\}/g, function (m, x) { return _wrap(x) + '\u20d7'; });
+            /* 带花括号的上下标 */
+            t = t.replace(/\^\{([^{}]*)\}/g, function (m, b) {
+                var r = _mapAll(_linearBody(b), sup);
+                return r === null ? '^' + _wrap(b) : r;
+            });
+            t = t.replace(/_\{([^{}]*)\}/g, function (m, b) {
+                var r = _mapAll(_linearBody(b), sub);
+                return r === null ? '_' + _wrap(b) : r;
+            });
+        } while (t !== prev && guard++ < 24);
+
+        /* 单字符上下标：x^2 → x²（只认字母数字，避免把 ^( 误转成 ⁽） */
+        t = t.replace(/\^([0-9A-Za-z\u0370-\u03ff])/g, function (m, c) {
+            return Object.prototype.hasOwnProperty.call(sup, c) ? sup[c] : '^' + c;
+        });
+        t = t.replace(/_([0-9A-Za-z\u0370-\u03ff])/g, function (m, c) {
+            return Object.prototype.hasOwnProperty.call(sub, c) ? sub[c] : '_' + c;
+        });
+
+        /* ---- 6) 收尾清理 ---- */
+        /* 绝对值/范数竖线两侧不留空格：| x | → |x| */
+        t = t.replace(/([|‖])\s+/g, '$1').replace(/\s+([|‖])/g, '$1');
+        t = t.replace(/\\%/g, '%').replace(/\\\{/g, '{').replace(/\\\}/g, '}');
+        t = t.replace(/\\(?:,|;|:|!|quad|qquad)/g, ' ');
         t = t.replace(/\\\\/g, '；');
-        t = t.replace(/\\overline\s*\{([^{}]*)\}/g, 'overline($1)');
-        t = t.replace(/\\hat\s*\{([^{}]*)\}/g, '$1^');
-        t = t.replace(/\\vec\s*\{([^{}]*)\}/g, '$1→');
-        /* 残留命令兜底：未知 \command 直接剥掉反斜杠保留名字 */
+        /* 未知命令兜底：剥掉反斜杠保留名字 */
         t = t.replace(/\\([a-zA-Z]+)/g, '$1');
         t = t.replace(/[{}]/g, '');
-        /* 多空格归一 */
+        t = t.replace(/\(\s+/g, '(').replace(/\s+\)/g, ')');
         t = t.replace(/ {3,}/g, '  ');
         return t.trim();
     }
+
     /** 提取 $..$（块级）与 $..$（行内）公式，替换为图片占位符（复用图片占行机制）。
      * 规则：$ 后非空白且配对侧非数字，避免「价格 $5」误判。 */
     function xyhExtractFormulas(text) {
