@@ -1,13 +1,13 @@
 {
-  "version": "1.0.2",
-  "updatedAt": "2026-10-13",
+  "version": "1.0.3",
+  "updatedAt": "2026-10-18",
   "installUrl": "https://scriptcat.org/scripts/code/8408/%E5%B0%8F%E9%9B%85%E4%BD%9C%E4%B8%9A%E5%8D%8E%E4%B8%BA%E7%AC%94%E8%AE%B0%E5%AF%BC%E5%87%BA.user.js",
   "notes": [
-    "📝 新增 Markdown 转手写：标题/列表/代码块/引用，空行保留为段落间距",
-    "∑ 数学公式手写体化：LaTeX 线性化为 Unicode 文本，与正文统一笔迹",
-    "📄 三面板界面：作业归档 / 纯文字 / Markdown 独立切换",
-    "↻ 面板新增检查更新按钮：实时检查 + 更新日志 + 一键前往安装页",
-    "🧻 hinote 白纸纯净版：移除页面虚线横格线（PDF/图片保留纸感横线）",
-    "🪶 公式映射表外置（xy-hw-tex.json），脚本本体不内嵌映射数据"
+    "√ 根号：√2 不再套多余括号，嵌套 √(a/b)、²√ 正常，√5 简写也能识别",
+    "| 绝对值：|x|、|x-1| 正确（含 \\left| \\lvert \\vert 各写法），范数 ‖u‖ 用双竖线",
+    "▦ 矩阵 \\begin{bmatrix} 转成 [1 2 5 ; 0 2 2 ; 0 0 4]，不再出现 beginbmatrix 字样",
+    "▦ Markdown 表格结构化：表头 + 横线 + 数据行，列用 ｜ 分隔",
+    "【】 \\boxed 答案框、上标 °（角度）、\\mathsf T 转置等修饰命令正确处理",
+    "△ 修复 \\frac 里套 \\sqrt 时残留 frac 的严重错乱"
   ]
 }
